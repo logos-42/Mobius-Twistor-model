@@ -22,6 +22,7 @@ wheels/
 
 # Virtual Environment
 venv/
+venv_gpu/
 ENV/
 env/
 
@@ -38,6 +39,8 @@ env/
 # PyTorch
 *.pth
 *.pt
+best_model.pth
+checkpoint*.pth
 
 # OS
 .DS_Store

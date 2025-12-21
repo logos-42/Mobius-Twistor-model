@@ -1,6 +1,7 @@
 """
 扭量嵌套学习 (Twistor Nested Learning)
 将HOPE的Nested Learning迁移到扭量几何框架
+支持动态嵌套权重、层级学习率策略、残差连接优化
 """
 
 import torch
@@ -77,6 +78,83 @@ class PiNestedOptimizer:
         self.optimizer.load_state_dict(state_dict)
 
 
+class DynamicNestedWeights(nn.Module):
+    """
+    动态嵌套权重调整：根据训练进度动态调整权重
+    权重从初始值逐渐增加到目标值（模拟warmup）
+    """
+    
+    def __init__(
+        self,
+        num_levels: int,
+        initial_weight: float = 0.01,
+        target_weight: float = 0.1
+    ):
+        super().__init__()
+        self.num_levels = num_levels
+        self.initial_weight = initial_weight
+        self.target_weight = target_weight
+        
+        # 可学习的权重调整因子
+        self.weight_factors = nn.Parameter(
+            torch.ones(num_levels) * initial_weight
+        )
+    
+    def forward(self, current_step: int, total_steps: int) -> torch.Tensor:
+        """
+        根据训练进度调整权重
+        
+        Args:
+            current_step: 当前训练步数
+            total_steps: 总训练步数
+        
+        Returns:
+            调整后的权重张量，形状为 (num_levels,)
+        """
+        # 根据训练进度调整权重
+        progress = min(current_step / max(total_steps, 1), 1.0)
+        base_weights = self.initial_weight + \
+                      (self.target_weight - self.initial_weight) * progress
+        
+        # 应用可学习的调整因子
+        weights = base_weights * torch.sigmoid(self.weight_factors)
+        
+        return weights
+
+
+class LevelWiseLearningRate:
+    """
+    层级学习率策略：深层使用较小学习率，浅层使用较大学习率
+    实现学习率衰减策略
+    """
+    
+    def __init__(
+        self,
+        base_lr: float,
+        decay_factor: float = 0.9,
+        num_levels: int = 5
+    ):
+        self.base_lr = base_lr
+        self.decay_factor = decay_factor
+        self.num_levels = num_levels
+    
+    def get_level_lrs(self) -> List[float]:
+        """
+        获取每层的学习率
+        
+        Returns:
+            学习率列表，深层学习率 = base_lr * (decay_factor ** level)
+        """
+        return [
+            self.base_lr * (self.decay_factor ** level)
+            for level in range(self.num_levels)
+        ]
+    
+    def get_level_lr(self, level: int) -> float:
+        """获取指定层级的学习率"""
+        return self.base_lr * (self.decay_factor ** level)
+
+
 class IncidenceConstraint(nn.Module):
     """
     关联方程约束：通过扭量关联方程连接ω和π的嵌套优化层级
@@ -130,6 +208,10 @@ class TwistorNestedLearning(nn.Module):
     
     将HOPE的Nested Learning迁移到扭量几何框架
     支持多层嵌套结构（默认5层）
+    新增功能：
+    - 动态嵌套权重调整
+    - 层级学习率策略
+    - 可学习的残差连接权重
     """
     
     def __init__(
@@ -141,7 +223,11 @@ class TwistorNestedLearning(nn.Module):
         optimizer_type: type = optim.Adam,
         num_nested_levels: int = 5,
         nested_level_lrs: Optional[List[float]] = None,
-        use_level_constraints: bool = True
+        use_level_constraints: bool = True,
+        use_dynamic_weights: bool = True,
+        use_levelwise_lr: bool = True,
+        lr_decay_factor: float = 0.9,
+        use_learnable_residual: bool = True
     ):
         super().__init__()
         self.dim = dim
@@ -151,20 +237,28 @@ class TwistorNestedLearning(nn.Module):
         self.optimizer_type = optimizer_type
         self.num_nested_levels = num_nested_levels
         self.use_level_constraints = use_level_constraints
+        self.use_dynamic_weights = use_dynamic_weights
+        self.use_levelwise_lr = use_levelwise_lr
+        self.use_learnable_residual = use_learnable_residual
         
-        # 设置每层的学习率
-        if nested_level_lrs is None:
-            # 默认：每层使用统一学习率
-            self.omega_level_lrs = [omega_lr] * num_nested_levels
-            self.pi_level_lrs = [pi_lr] * num_nested_levels
-        else:
+        # 层级学习率策略
+        if use_levelwise_lr:
+            omega_lr_strategy = LevelWiseLearningRate(omega_lr, lr_decay_factor, num_nested_levels)
+            pi_lr_strategy = LevelWiseLearningRate(pi_lr, lr_decay_factor, num_nested_levels)
+            self.omega_level_lrs = omega_lr_strategy.get_level_lrs()
+            self.pi_level_lrs = pi_lr_strategy.get_level_lrs()
+        elif nested_level_lrs is not None:
             # 使用指定的学习率
             if len(nested_level_lrs) != num_nested_levels:
                 raise ValueError(f"nested_level_lrs长度必须等于num_nested_levels ({num_nested_levels})")
             self.omega_level_lrs = nested_level_lrs
             self.pi_level_lrs = nested_level_lrs
+        else:
+            # 默认：每层使用统一学习率
+            self.omega_level_lrs = [omega_lr] * num_nested_levels
+            self.pi_level_lrs = [pi_lr] * num_nested_levels
         
-        # 5层嵌套网络：每层都是独立的网络模块
+        # 嵌套网络：每层都是独立的网络模块
         self.omega_nets = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(dim // 2, dim // 2),
@@ -181,6 +275,18 @@ class TwistorNestedLearning(nn.Module):
             ) for _ in range(num_nested_levels)
         ])
         
+        # 动态嵌套权重（如果启用）
+        if use_dynamic_weights:
+            self.dynamic_omega_weights = DynamicNestedWeights(
+                num_nested_levels, initial_weight=0.01, target_weight=0.1
+            )
+            self.dynamic_pi_weights = DynamicNestedWeights(
+                num_nested_levels, initial_weight=0.01, target_weight=0.1
+            )
+        else:
+            self.dynamic_omega_weights = None
+            self.dynamic_pi_weights = None
+        
         # 每层有自己的嵌套权重（递减权重）
         self.omega_nested_weights = nn.ParameterList([
             nn.Parameter(torch.ones(1) * (0.1 / (i + 1))) 
@@ -191,6 +297,20 @@ class TwistorNestedLearning(nn.Module):
             nn.Parameter(torch.ones(1) * (0.1 / (i + 1))) 
             for i in range(num_nested_levels)
         ])
+        
+        # 可学习的残差连接权重（如果启用）
+        if use_learnable_residual:
+            self.omega_residual_weights = nn.ParameterList([
+                nn.Parameter(torch.ones(1) * 0.5)  # 初始权重0.5，平衡残差和变换
+                for _ in range(num_nested_levels)
+            ])
+            self.pi_residual_weights = nn.ParameterList([
+                nn.Parameter(torch.ones(1) * 0.5)
+                for _ in range(num_nested_levels)
+            ])
+        else:
+            self.omega_residual_weights = None
+            self.pi_residual_weights = None
         
         # 创建嵌套优化器（每层一个）
         self.omega_optimizers: List[Optional[OmegaNestedOptimizer]] = [None] * num_nested_levels
@@ -207,6 +327,10 @@ class TwistorNestedLearning(nn.Module):
             ])
         else:
             self.level_constraints = None
+        
+        # 训练步数跟踪（用于动态权重）
+        self.register_buffer('current_step', torch.tensor(0))
+        self.register_buffer('total_steps', torch.tensor(10000))  # 默认值
         
     def create_nested_optimizers(self):
         """创建嵌套优化器（每层一个）"""
@@ -225,6 +349,17 @@ class TwistorNestedLearning(nn.Module):
                     lr=self.pi_level_lrs[level]
                 )
     
+    def set_training_progress(self, current_step: int, total_steps: int):
+        """
+        设置训练进度（用于动态权重调整）
+        
+        Args:
+            current_step: 当前训练步数
+            total_steps: 总训练步数
+        """
+        self.current_step.fill_(current_step)
+        self.total_steps.fill_(total_steps)
+    
     def forward(
         self,
         x: torch.Tensor,
@@ -232,6 +367,7 @@ class TwistorNestedLearning(nn.Module):
     ) -> tuple:
         """
         前向传播：扭量嵌套学习（多层嵌套）
+        支持动态权重、可学习残差连接
         
         Args:
             x: 输入张量（扭量表示），形状为 (batch, seq, dim)
@@ -247,6 +383,20 @@ class TwistorNestedLearning(nn.Module):
         omega_input = omega
         pi_input = pi
         
+        # 获取动态权重（如果启用）
+        if self.use_dynamic_weights and self.dynamic_omega_weights is not None:
+            dynamic_omega_ws = self.dynamic_omega_weights(
+                int(self.current_step.item()),
+                int(self.total_steps.item())
+            )
+            dynamic_pi_ws = self.dynamic_pi_weights(
+                int(self.current_step.item()),
+                int(self.total_steps.item())
+            )
+        else:
+            dynamic_omega_ws = None
+            dynamic_pi_ws = None
+        
         # 逐层处理（嵌套前向传播）
         omega_prev = omega
         pi_prev = pi
@@ -258,8 +408,27 @@ class TwistorNestedLearning(nn.Module):
             pi_level = self.pi_nets[level](pi_prev)
             
             # 应用嵌套权重（残差连接）
-            omega_prev = omega_prev + self.omega_nested_weights[level] * (omega_level - omega_prev)
-            pi_prev = pi_prev + self.pi_nested_weights[level] * (pi_level - pi_prev)
+            if self.use_learnable_residual and self.omega_residual_weights is not None:
+                # 使用可学习的残差权重
+                residual_weight_omega = torch.sigmoid(self.omega_residual_weights[level])
+                residual_weight_pi = torch.sigmoid(self.pi_residual_weights[level])
+                
+                omega_prev = residual_weight_omega * omega_prev + \
+                            (1 - residual_weight_omega) * omega_level
+                pi_prev = residual_weight_pi * pi_prev + \
+                          (1 - residual_weight_pi) * pi_level
+            else:
+                # 使用固定嵌套权重
+                nested_weight_omega = self.omega_nested_weights[level]
+                nested_weight_pi = self.pi_nested_weights[level]
+                
+                # 如果使用动态权重，则应用动态调整
+                if dynamic_omega_ws is not None:
+                    nested_weight_omega = nested_weight_omega * dynamic_omega_ws[level]
+                    nested_weight_pi = nested_weight_pi * dynamic_pi_ws[level]
+                
+                omega_prev = omega_prev + nested_weight_omega * (omega_level - omega_prev)
+                pi_prev = pi_prev + nested_weight_pi * (pi_level - pi_prev)
             
             # 层级间的关联约束（如果启用）
             if self.use_level_constraints and level < self.num_nested_levels - 1:
@@ -331,5 +500,8 @@ class TwistorNestedLearning(nn.Module):
         return (f'dim={self.dim}, omega_lr={self.omega_lr}, pi_lr={self.pi_lr}, '
                 f'constraint_weight={self.constraint_weight}, '
                 f'num_nested_levels={self.num_nested_levels}, '
-                f'use_level_constraints={self.use_level_constraints}')
+                f'use_level_constraints={self.use_level_constraints}, '
+                f'use_dynamic_weights={self.use_dynamic_weights}, '
+                f'use_levelwise_lr={self.use_levelwise_lr}, '
+                f'use_learnable_residual={self.use_learnable_residual}')
 

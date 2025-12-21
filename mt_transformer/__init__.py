@@ -36,6 +36,15 @@ from .twistor_titans_recurrent import TwistorTitansRecurrent
 from .twistor_self_modifying_recurrent import TwistorSelfModifyingRecurrent
 from .twistor_hope_architecture import TwistorHopeArchitecture
 
+# 模型配置模块
+from .model_configs import (
+    MODEL_CONFIGS,
+    get_config,
+    create_full_config,
+    estimate_parameters,
+    validate_config
+)
+
 __all__ = [
     # 基础组件
     'SpinorEmbedding',
@@ -65,6 +74,12 @@ __all__ = [
     'TwistorTitansRecurrent',
     'TwistorSelfModifyingRecurrent',
     'TwistorHopeArchitecture',
+    # 模型配置
+    'MODEL_CONFIGS',
+    'get_config',
+    'create_full_config',
+    'estimate_parameters',
+    'validate_config',
 ]
 
 __version__ = '0.1.4'
