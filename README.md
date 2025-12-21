@@ -33,68 +33,25 @@ HOPE（Self-modifying Architecture with Continuum Memory）是Google Research提
 
 ## 安装
 
-```bash
-pip install -r requirements.txt
-```
+安装依赖包：`pip install -r requirements.txt`
 
 ## 快速开始
 
 ### 基本使用
 
-```python
-import torch
-from mt_transformer import SpinorEmbedding, IncidenceAttention, MobiusLayer
-
-# 创建组件
-vocab_size = 1000
-dim = 128
-embedding = SpinorEmbedding(vocab_size=vocab_size, dim=dim // 2)
-attention = IncidenceAttention(dim=dim)
-mobius = MobiusLayer(dim=dim)
-
-# 使用
-token_ids = torch.randint(0, vocab_size, (2, 10))  # (batch, seq)
-x = embedding(token_ids)  # (batch, seq, dim)
-x = attention(x)
-x = mobius(x)
-```
+导入所需组件，创建模型实例，进行前向传播。详细示例请参考 `examples/demo.py`。
 
 ### 扭量化HOPE架构
 
-```python
-from mt_transformer import TwistorHopeArchitecture
-from mt_transformer.model_configs import create_full_config
+使用 `TwistorHopeArchitecture` 创建完整的扭量化HOPE模型，支持多种预设配置。详细使用请参考 `examples/train_optimized.py`。
 
-# 使用推荐配置
-full_config = create_full_config(config_name='recommended', vocab_size=1000)
-model = TwistorHopeArchitecture(**full_config)
+### 优化训练
 
-# 前向传播
-token_ids = torch.randint(0, 1000, (2, 32))
-output, constraint_loss = model(token_ids, return_constraint_loss=True)
-```
-
-### 使用优化训练脚本
-
-```python
-# 直接运行优化训练脚本
-python examples/train_optimized.py --config recommended
-
-# 或使用Python API
-from examples.train_optimized import create_optimized_model
-
-model, config = create_optimized_model(
-    config_name='recommended',
-    vocab_size=1000,
-    device=torch.device('cuda')
-)
-```
+使用 `train_optimized.py` 脚本进行优化训练，支持配置选择、混合精度训练、梯度累积等优化功能。
 
 ## 运行测试
 
-```bash
-python examples/demo.py
-```
+运行 `examples/demo.py` 进行基础测试，运行 `examples/performance_test.py` 进行性能测试。
 
 ## 模型配置
 
@@ -102,18 +59,7 @@ python examples/demo.py
 
 ### 预设配置
 
-```python
-from mt_transformer.model_configs import get_config, create_full_config
-
-# 获取预设配置
-config = get_config('recommended')  # 'small', 'medium', 'recommended', 'large'
-
-# 创建完整配置（包含所有必需参数）
-full_config = create_full_config(
-    config_name='recommended',
-    vocab_size=1000
-)
-```
+支持 `small`, `medium`, `recommended`, `large` 四种预设配置。使用 `model_configs.get_config()` 获取配置，使用 `create_full_config()` 创建完整配置。
 
 ### 配置对比
 
@@ -141,16 +87,7 @@ full_config = create_full_config(
 
 ### 扭量化HOPE架构（Recurrent版本）
 
-```
-Token IDs 
-  → SpinorEmbedding (扭量表示: ω和π)
-  → TwistorSelfModifyingRecurrent (扭量自我修正，Recurrent版本)
-    → TwistorTitansRecurrent (扭量化循环层)
-    → AdaptiveMobiusLayer (自适应莫比乌斯层)
-  → TwistorMemorySystem (扭量记忆系统，循环更新)
-  → TwistorNestedLearning (扭量嵌套学习)
-  → 输出
-```
+Token IDs → SpinorEmbedding (扭量表示: ω和π) → TwistorSelfModifyingRecurrent (扭量自我修正，Recurrent版本) → TwistorTitansRecurrent (扭量化循环层) → AdaptiveMobiusLayer (自适应莫比乌斯层) → TwistorMemorySystem (扭量记忆系统，循环更新) → TwistorNestedLearning (扭量嵌套学习) → 输出
 
 **注意**: 这是真正的Recurrent结构，完全移除了注意力机制，符合Google HOPE架构的Titans设计。
 
@@ -167,50 +104,19 @@ Token IDs
 
 ### 混合精度训练 (AMP)
 
-使用混合精度训练可以节省约50%的显存，同时提升约30%的训练速度：
-
-```python
-# 在 train_gpu.py 中自动启用（GPU环境）
-use_amp = True  # 自动检测GPU并启用
-```
+使用混合精度训练可以节省约50%的显存，同时提升约30%的训练速度。在 `train_gpu.py` 中自动检测GPU并启用。
 
 ### 梯度累积
 
-通过梯度累积可以模拟更大的batch size，而不增加显存占用：
-
-```python
-gradient_accumulation_steps = 4  # 等效batch size = batch_size * 4
-```
+通过梯度累积可以模拟更大的batch size，而不增加显存占用。支持自定义累积步数。
 
 ### 学习率调度
 
-支持Warmup + Cosine退火学习率调度：
-
-```python
-# 自动配置（train_gpu.py）
-use_lr_scheduling = True
-warmup_ratio = 0.1  # 前10%步数用于warmup
-min_lr = 1e-6       # 最小学习率
-```
+支持Warmup + Cosine退火学习率调度。前10%步数用于warmup，之后使用cosine退火。
 
 ### 优化训练脚本
 
-使用 `train_optimized.py` 可以快速开始优化训练：
-
-```bash
-# 使用推荐配置
-python examples/train_optimized.py --config recommended
-
-# 使用小配置（适合4GB显存）
-python examples/train_optimized.py --config small
-
-# 自定义参数
-python examples/train_optimized.py \
-    --config recommended \
-    --batch-size 16 \
-    --num-epochs 20 \
-    --learning-rate 2e-4
-```
+使用 `train_optimized.py` 可以快速开始优化训练，支持配置选择、自定义batch size、学习率等参数。
 
 ### 训练优化功能
 
@@ -246,18 +152,7 @@ python examples/train_optimized.py \
 
 ### 性能测试
 
-运行性能测试脚本：
-
-```bash
-python examples/performance_test.py
-```
-
-测试内容包括：
-- 参数量统计
-- 内存占用估算
-- 前向传播速度
-- 训练速度
-- 不同配置对比
+运行 `examples/performance_test.py` 进行性能测试，包括参数量统计、内存占用估算、前向传播速度、训练速度和不同配置对比。
 
 ## 文件结构
 
@@ -316,4 +211,3 @@ MIT License
 ## 贡献
 
 欢迎提交Issue和Pull Request！
-
