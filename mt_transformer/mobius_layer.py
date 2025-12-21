@@ -21,9 +21,18 @@ class MobiusLayer(nn.Module):
         dim: 输入维度（应该是偶数，因为包含ω和π两个分量）
         coupling_coeff: 拓扑耦合系数，控制莫比乌斯变换的强度（默认0.1）
         use_complex: 是否使用PyTorch原生复数类型（默认False，使用分离实部虚部）
+        num_cycles: 莫比乌斯循环次数（默认3）
+        progressive_coupling: 是否使用渐进式耦合（每次循环耦合系数递增，默认True）
     """
     
-    def __init__(self, dim: int, coupling_coeff: float = 0.1, use_complex: bool = False):
+    def __init__(
+        self,
+        dim: int,
+        coupling_coeff: float = 0.1,
+        use_complex: bool = False,
+        num_cycles: int = 3,
+        progressive_coupling: bool = True
+    ):
         super().__init__()
         if dim % 2 != 0:
             raise ValueError(f"维度必须是偶数，因为包含ω和π两个分量，当前维度: {dim}")
@@ -31,6 +40,8 @@ class MobiusLayer(nn.Module):
         self.dim = dim
         self.coupling_coeff = coupling_coeff
         self.use_complex = use_complex
+        self.num_cycles = num_cycles
+        self.progressive_coupling = progressive_coupling
         
         # 定义辛形式的扭转矩阵 (Symplectic Twist)
         # 这个矩阵用于旋量分量的交换操作
@@ -41,13 +52,20 @@ class MobiusLayer(nn.Module):
         前向传播：执行莫比乌斯变换
         
         Args:
-            z: 输入张量，形状为 (batch_size, seq_len, dim)
+            z: 输入张量，形状为 (batch_size, seq_len, dim) 或 (batch_size, dim)
                 如果use_complex=False，z是实数张量，前dim//2是ω的实部虚部，后dim//2是π的实部虚部
                 如果use_complex=True，z是复数张量，前dim//2是ω，后dim//2是π
         
         Returns:
             变换后的张量，形状与输入相同
         """
+        # 处理2D和3D输入
+        if z.dim() == 2:
+            z = z.unsqueeze(1)  # (batch, 1, dim)
+            squeeze_output = True
+        else:
+            squeeze_output = False
+        
         batch_size, seq_len, dim = z.shape
         
         if dim != self.dim:
@@ -96,12 +114,51 @@ class MobiusLayer(nn.Module):
             
             z_twisted = torch.cat([omega_new, pi_new], dim=-1)
         
-        # 混合原始信号（残差连接）
-        # 拓扑耦合系数控制莫比乌斯变换的强度
-        output = z + self.coupling_coeff * z_twisted
+        # 多层莫比乌斯循环变换
+        output = z
+        for cycle in range(self.num_cycles):
+            # 计算当前循环的耦合系数
+            if self.progressive_coupling:
+                # 渐进式耦合：每次循环的耦合系数递增
+                current_coupling = self.coupling_coeff * (cycle + 1) / self.num_cycles
+            else:
+                # 固定耦合系数
+                current_coupling = self.coupling_coeff
+            
+            # 执行莫比乌斯变换
+            omega, pi = output.chunk(2, dim=-1)
+            
+            if self.use_complex:
+                omega_new = torch.conj(pi)
+                pi_new = -torch.conj(omega)
+                z_twisted = torch.cat([omega_new, pi_new], dim=-1)
+            else:
+                omega_dim = omega.shape[-1]
+                if omega_dim % 2 == 0:
+                    omega_real, omega_imag = omega.chunk(2, dim=-1)
+                    pi_real, pi_imag = pi.chunk(2, dim=-1)
+                    omega_new_real = pi_real
+                    omega_new_imag = -pi_imag
+                    pi_new_real = -omega_real
+                    pi_new_imag = omega_imag
+                    omega_new = torch.cat([omega_new_real, omega_new_imag], dim=-1)
+                    pi_new = torch.cat([pi_new_real, pi_new_imag], dim=-1)
+                else:
+                    omega_new = pi
+                    pi_new = -omega
+                z_twisted = torch.cat([omega_new, pi_new], dim=-1)
+            
+            # 混合原始信号（残差连接）
+            output = output + current_coupling * z_twisted
+        
+        # 如果输入是2D，恢复为2D
+        if squeeze_output:
+            output = output.squeeze(1)  # (batch, dim)
         
         return output
     
     def extra_repr(self) -> str:
-        return f'dim={self.dim}, coupling_coeff={self.coupling_coeff}, use_complex={self.use_complex}'
+        return (f'dim={self.dim}, coupling_coeff={self.coupling_coeff}, '
+                f'use_complex={self.use_complex}, num_cycles={self.num_cycles}, '
+                f'progressive_coupling={self.progressive_coupling}')
 

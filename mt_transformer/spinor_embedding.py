@@ -71,6 +71,9 @@ class SpinorEmbedding(nn.Module):
             pass
         
         # 位置编码（可选，用于增强位置信息）
+        # 注意：twistor 是 omega 和 pi 的拼接，所以总维度是 dim*4
+        # 但位置编码只需要 dim*2（因为 omega 和 pi 各占 dim*2）
+        # 我们会对 omega 和 pi 分别应用相同的位置编码
         self.register_buffer(
             'pos_encoding',
             self._create_positional_encoding(max_seq_len, dim)
@@ -94,14 +97,28 @@ class SpinorEmbedding(nn.Module):
         else:
             # 分离实部虚部的位置编码
             position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+            # div_term 的长度是 dim//2，用于生成 sin/cos 对
             div_term = torch.exp(torch.arange(0, dim, 2).float() * 
                                 (-math.log(10000.0) / dim))
             pos_encoding = torch.zeros(max_len, dim * 2, dtype=torch.float32)
-            pos_encoding[:, 0::2] = torch.sin(position * div_term)
-            pos_encoding[:, 1::2] = torch.cos(position * div_term)
-            # 对于虚部，使用相位偏移
-            pos_encoding[:, dim::2] = torch.cos(position * div_term)
-            pos_encoding[:, dim+1::2] = -torch.sin(position * div_term)
+            
+            # 计算位置编码值，形状为 (max_len, dim//2)
+            pe_sin = torch.sin(position * div_term)  # (max_len, dim//2)
+            pe_cos = torch.cos(position * div_term)  # (max_len, dim//2)
+            
+            # 填充实部部分（前 dim 个位置）：sin, cos, sin, cos, ...
+            # 将 (max_len, dim//2) 扩展为 (max_len, dim) 通过重复
+            pe_real = torch.zeros(max_len, dim, dtype=torch.float32)
+            pe_real[:, 0::2] = pe_sin  # 偶数位置：sin
+            pe_real[:, 1::2] = pe_cos  # 奇数位置：cos
+            pos_encoding[:, :dim] = pe_real
+            
+            # 填充虚部部分（后 dim 个位置）：cos, -sin, cos, -sin, ...
+            pe_imag = torch.zeros(max_len, dim, dtype=torch.float32)
+            pe_imag[:, 0::2] = pe_cos   # 偶数位置：cos
+            pe_imag[:, 1::2] = -pe_sin  # 奇数位置：-sin
+            pos_encoding[:, dim:] = pe_imag
+            
             return pos_encoding
     
     def forward(
@@ -153,6 +170,14 @@ class SpinorEmbedding(nn.Module):
                 else:
                     omega = pi
         
+        # 添加位置编码（在拼接之前，分别应用到 omega 和 pi）
+        if use_pos_encoding and seq_len <= self.max_seq_len:
+            pos_enc = self.pos_encoding[:seq_len]  # (seq_len, dim*2 or dim)
+            pos_enc = pos_enc.unsqueeze(0)  # (1, seq_len, dim*2 or dim)
+            # 分别应用到 omega 和 pi
+            omega = omega + pos_enc
+            pi = pi + pos_enc
+        
         # 组合ω和π
         if self.use_complex:
             # 复数情况：直接拼接
@@ -160,12 +185,6 @@ class SpinorEmbedding(nn.Module):
         else:
             # 分离实部虚部：拼接
             twistor = torch.cat([omega, pi], dim=-1)
-        
-        # 添加位置编码
-        if use_pos_encoding and seq_len <= self.max_seq_len:
-            pos_enc = self.pos_encoding[:seq_len]  # (seq_len, dim*2 or dim)
-            pos_enc = pos_enc.unsqueeze(0)  # (1, seq_len, dim*2 or dim)
-            twistor = twistor + pos_enc
         
         return twistor
     

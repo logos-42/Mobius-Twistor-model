@@ -6,7 +6,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 
 class OmegaNestedOptimizer:
@@ -129,6 +129,7 @@ class TwistorNestedLearning(nn.Module):
     扭量嵌套学习：整合ω/π嵌套优化器、关联方程约束
     
     将HOPE的Nested Learning迁移到扭量几何框架
+    支持多层嵌套结构（默认5层）
     """
     
     def __init__(
@@ -137,7 +138,10 @@ class TwistorNestedLearning(nn.Module):
         omega_lr: float = 1e-4,
         pi_lr: float = 1e-4,
         constraint_weight: float = 0.1,
-        optimizer_type: type = optim.Adam
+        optimizer_type: type = optim.Adam,
+        num_nested_levels: int = 5,
+        nested_level_lrs: Optional[List[float]] = None,
+        use_level_constraints: bool = True
     ):
         super().__init__()
         self.dim = dim
@@ -145,46 +149,81 @@ class TwistorNestedLearning(nn.Module):
         self.pi_lr = pi_lr
         self.constraint_weight = constraint_weight
         self.optimizer_type = optimizer_type
+        self.num_nested_levels = num_nested_levels
+        self.use_level_constraints = use_level_constraints
         
-        # ω分量的参数（示例：一个简单的线性层）
-        self.omega_net = nn.Sequential(
-            nn.Linear(dim // 2, dim // 2),
-            nn.GELU(),
-            nn.Linear(dim // 2, dim // 2)
-        )
+        # 设置每层的学习率
+        if nested_level_lrs is None:
+            # 默认：每层使用统一学习率
+            self.omega_level_lrs = [omega_lr] * num_nested_levels
+            self.pi_level_lrs = [pi_lr] * num_nested_levels
+        else:
+            # 使用指定的学习率
+            if len(nested_level_lrs) != num_nested_levels:
+                raise ValueError(f"nested_level_lrs长度必须等于num_nested_levels ({num_nested_levels})")
+            self.omega_level_lrs = nested_level_lrs
+            self.pi_level_lrs = nested_level_lrs
         
-        # π分量的参数（示例：一个简单的线性层）
-        self.pi_net = nn.Sequential(
-            nn.Linear(dim // 2, dim // 2),
-            nn.GELU(),
-            nn.Linear(dim // 2, dim // 2)
-        )
+        # 5层嵌套网络：每层都是独立的网络模块
+        self.omega_nets = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(dim // 2, dim // 2),
+                nn.GELU(),
+                nn.Linear(dim // 2, dim // 2)
+            ) for _ in range(num_nested_levels)
+        ])
         
-        # 创建嵌套优化器
-        self.omega_optimizer: Optional[OmegaNestedOptimizer] = None
-        self.pi_optimizer: Optional[PiNestedOptimizer] = None
+        self.pi_nets = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(dim // 2, dim // 2),
+                nn.GELU(),
+                nn.Linear(dim // 2, dim // 2)
+            ) for _ in range(num_nested_levels)
+        ])
         
-        # 关联方程约束
+        # 每层有自己的嵌套权重（递减权重）
+        self.omega_nested_weights = nn.ParameterList([
+            nn.Parameter(torch.ones(1) * (0.1 / (i + 1))) 
+            for i in range(num_nested_levels)
+        ])
+        
+        self.pi_nested_weights = nn.ParameterList([
+            nn.Parameter(torch.ones(1) * (0.1 / (i + 1))) 
+            for i in range(num_nested_levels)
+        ])
+        
+        # 创建嵌套优化器（每层一个）
+        self.omega_optimizers: List[Optional[OmegaNestedOptimizer]] = [None] * num_nested_levels
+        self.pi_optimizers: List[Optional[PiNestedOptimizer]] = [None] * num_nested_levels
+        
+        # 关联方程约束（全局）
         self.incidence_constraint = IncidenceConstraint(dim, constraint_weight)
         
-        # 嵌套学习权重（控制嵌套优化的强度）
-        self.nested_weight = nn.Parameter(torch.ones(1) * 0.1)
+        # 层级间的关联约束（如果启用）
+        if use_level_constraints:
+            self.level_constraints = nn.ModuleList([
+                IncidenceConstraint(dim, constraint_weight * 0.5) 
+                for _ in range(num_nested_levels - 1)
+            ])
+        else:
+            self.level_constraints = None
         
     def create_nested_optimizers(self):
-        """创建嵌套优化器"""
-        if self.omega_optimizer is None:
-            self.omega_optimizer = OmegaNestedOptimizer(
-                self.omega_net.parameters(),
-                optimizer_type=self.optimizer_type,
-                lr=self.omega_lr
-            )
-        
-        if self.pi_optimizer is None:
-            self.pi_optimizer = PiNestedOptimizer(
-                self.pi_net.parameters(),
-                optimizer_type=self.optimizer_type,
-                lr=self.pi_lr
-            )
+        """创建嵌套优化器（每层一个）"""
+        for level in range(self.num_nested_levels):
+            if self.omega_optimizers[level] is None:
+                self.omega_optimizers[level] = OmegaNestedOptimizer(
+                    self.omega_nets[level].parameters(),
+                    optimizer_type=self.optimizer_type,
+                    lr=self.omega_level_lrs[level]
+                )
+            
+            if self.pi_optimizers[level] is None:
+                self.pi_optimizers[level] = PiNestedOptimizer(
+                    self.pi_nets[level].parameters(),
+                    optimizer_type=self.optimizer_type,
+                    lr=self.pi_level_lrs[level]
+                )
     
     def forward(
         self,
@@ -192,7 +231,7 @@ class TwistorNestedLearning(nn.Module):
         compute_constraint: bool = True
     ) -> tuple:
         """
-        前向传播：扭量嵌套学习
+        前向传播：扭量嵌套学习（多层嵌套）
         
         Args:
             x: 输入张量（扭量表示），形状为 (batch, seq, dim)
@@ -204,50 +243,93 @@ class TwistorNestedLearning(nn.Module):
         # 分离ω和π分量
         omega, pi = x.chunk(2, dim=-1)  # 各为 (batch, seq, dim//2)
         
-        # 通过各自的网络处理
-        omega_processed = self.omega_net(omega)
-        pi_processed = self.pi_net(pi)
+        # 保存初始值用于残差连接
+        omega_input = omega
+        pi_input = pi
         
-        # 应用嵌套学习权重
-        omega_processed = omega + self.nested_weight * (omega_processed - omega)
-        pi_processed = pi + self.nested_weight * (pi_processed - pi)
+        # 逐层处理（嵌套前向传播）
+        omega_prev = omega
+        pi_prev = pi
+        constraint_loss = torch.tensor(0.0, device=x.device)
+        
+        for level in range(self.num_nested_levels):
+            # 通过当前层的网络处理
+            omega_level = self.omega_nets[level](omega_prev)
+            pi_level = self.pi_nets[level](pi_prev)
+            
+            # 应用嵌套权重（残差连接）
+            omega_prev = omega_prev + self.omega_nested_weights[level] * (omega_level - omega_prev)
+            pi_prev = pi_prev + self.pi_nested_weights[level] * (pi_level - pi_prev)
+            
+            # 层级间的关联约束（如果启用）
+            if self.use_level_constraints and level < self.num_nested_levels - 1:
+                level_constraint = self.level_constraints[level](omega_prev, pi_prev)
+                constraint_loss = constraint_loss + level_constraint
+        
+        # 最终输出
+        omega_processed = omega_prev
+        pi_processed = pi_prev
         
         # 组合输出
         output = torch.cat([omega_processed, pi_processed], dim=-1)
         
-        # 计算关联约束损失
-        constraint_loss = torch.tensor(0.0, device=x.device)
+        # 计算全局关联约束损失
         if compute_constraint:
-            constraint_loss = self.incidence_constraint(omega_processed, pi_processed)
+            global_constraint = self.incidence_constraint(omega_processed, pi_processed)
+            constraint_loss = constraint_loss + global_constraint
         
         return output, constraint_loss
     
     def nested_optimization_step(
         self,
-        omega_loss: torch.Tensor,
-        pi_loss: torch.Tensor
+        omega_losses: Optional[List[torch.Tensor]] = None,
+        pi_losses: Optional[List[torch.Tensor]] = None,
+        global_omega_loss: Optional[torch.Tensor] = None,
+        global_pi_loss: Optional[torch.Tensor] = None
     ):
         """
-        执行嵌套优化步骤
+        执行嵌套优化步骤（多层嵌套优化）
         
         Args:
-            omega_loss: ω分量的损失
-            pi_loss: π分量的损失
+            omega_losses: 每层ω分量的损失列表（可选）
+            pi_losses: 每层π分量的损失列表（可选）
+            global_omega_loss: 全局ω分量的损失（可选）
+            global_pi_loss: 全局π分量的损失（可选）
         """
-        if self.omega_optimizer is None or self.pi_optimizer is None:
+        if any(opt is None for opt in self.omega_optimizers) or any(opt is None for opt in self.pi_optimizers):
             self.create_nested_optimizers()
         
-        # ω分量优化
-        self.omega_optimizer.zero_grad()
-        omega_loss.backward(retain_graph=True)
-        self.omega_optimizer.step()
+        # 如果提供了每层损失，逐层优化
+        if omega_losses is not None and pi_losses is not None:
+            for level in range(self.num_nested_levels):
+                if level < len(omega_losses) and omega_losses[level] is not None:
+                    self.omega_optimizers[level].zero_grad()
+                    omega_losses[level].backward(retain_graph=True)
+                    self.omega_optimizers[level].step()
+                
+                if level < len(pi_losses) and pi_losses[level] is not None:
+                    self.pi_optimizers[level].zero_grad()
+                    pi_losses[level].backward(retain_graph=True)
+                    self.pi_optimizers[level].step()
         
-        # π分量优化
-        self.pi_optimizer.zero_grad()
-        pi_loss.backward()
-        self.pi_optimizer.step()
+        # 如果提供了全局损失，使用全局损失优化所有层
+        if global_omega_loss is not None:
+            for optimizer in self.omega_optimizers:
+                optimizer.zero_grad()
+            global_omega_loss.backward(retain_graph=True)
+            for optimizer in self.omega_optimizers:
+                optimizer.step()
+        
+        if global_pi_loss is not None:
+            for optimizer in self.pi_optimizers:
+                optimizer.zero_grad()
+            global_pi_loss.backward()
+            for optimizer in self.pi_optimizers:
+                optimizer.step()
     
     def extra_repr(self) -> str:
         return (f'dim={self.dim}, omega_lr={self.omega_lr}, pi_lr={self.pi_lr}, '
-                f'constraint_weight={self.constraint_weight}')
+                f'constraint_weight={self.constraint_weight}, '
+                f'num_nested_levels={self.num_nested_levels}, '
+                f'use_level_constraints={self.use_level_constraints}')
 

@@ -30,6 +30,12 @@ from .twistor_nested_learning import (
 )
 from .mt_hope_architecture import MTHopeArchitecture
 
+# 扭量化HOPE架构（Recurrent版本，无注意力）
+from .twistor_titans_cell import TwistorTitansCell
+from .twistor_titans_recurrent import TwistorTitansRecurrent
+from .twistor_self_modifying_recurrent import TwistorSelfModifyingRecurrent
+from .twistor_hope_architecture import TwistorHopeArchitecture
+
 __all__ = [
     # 基础组件
     'SpinorEmbedding',
@@ -54,7 +60,12 @@ __all__ = [
     'IncidenceConstraint',
     # 完整架构
     'MTHopeArchitecture',
+    # 扭量化HOPE架构（Recurrent版本）
+    'TwistorTitansCell',
+    'TwistorTitansRecurrent',
+    'TwistorSelfModifyingRecurrent',
+    'TwistorHopeArchitecture',
 ]
 
-__version__ = '0.2.0'
+__version__ = '0.1.4'
 

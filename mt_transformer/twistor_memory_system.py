@@ -196,14 +196,16 @@ class TwistorMemorySystem(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        update_memory: bool = True
+        update_memory: bool = True,
+        hidden_state: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
-        前向传播：更新记忆并注入到输出
+        前向传播：循环更新记忆并注入到输出
         
         Args:
             x: 输入张量，形状为 (batch, seq, dim)
             update_memory: 是否更新记忆（训练时使用）
+            hidden_state: 循环隐藏状态（可选），用于循环更新记忆
         
         Returns:
             输出张量，形状与输入相同
@@ -220,36 +222,46 @@ class TwistorMemorySystem(nn.Module):
         if self.use_phase_compression and self.phase_compression is not None:
             processed_memory = self.phase_compression(processed_memory)
         
-        # 计算记忆权重（使用门控机制）
-        memory_weights = []
-        for gate in self.update_gates:
-            # 使用输入的均值作为上下文
-            context = x.mean(dim=1)  # (batch, dim)
-            weight = gate(context)  # (batch, 1)
-            memory_weights.append(weight)
+        # 循环更新记忆（逐时间步）
+        outputs = []
+        for t in range(seq_len):
+            x_t = x[:, t, :]  # (batch, dim)
+            
+            # 计算记忆权重（使用门控机制）
+            memory_weights = []
+            for gate in self.update_gates:
+                # 使用当前时间步的输入作为上下文
+                weight = gate(x_t)  # (batch, 1)
+                memory_weights.append(weight)
+            
+            # 组合记忆权重
+            memory_weights = torch.stack(memory_weights, dim=1)  # (batch, num_memories, 1)
+            memory_weights = F.softmax(memory_weights, dim=1)  # 归一化
+            
+            # 加权组合记忆
+            memory_broadcast = processed_memory.unsqueeze(0) * memory_weights  # (batch, num_memories, dim)
+            memory_combined = memory_broadcast.sum(dim=1)  # (batch, dim)
+            
+            # 将记忆注入到当前时间步的输出
+            output_t = x_t + memory_combined
+            outputs.append(output_t)
+            
+            # 循环更新记忆（如果启用）
+            if update_memory and self.training:
+                # 分离ω和π分量
+                omega_t, pi_t = x_t.chunk(2, dim=-1)
+                # 使用加权更新率
+                effective_update_rate = self.update_rate * memory_weights.mean()
+                self.memory_state.update_memory(omega_t, pi_t, effective_update_rate)
+                
+                # 更新处理后的记忆（用于下一个时间步）
+                memory = self.memory_state.get_memory()
+                processed_memory = self.memory_cycle(memory)
+                if self.use_phase_compression and self.phase_compression is not None:
+                    processed_memory = self.phase_compression(processed_memory)
         
-        # 组合记忆权重
-        memory_weights = torch.stack(memory_weights, dim=1)  # (batch, num_memories, 1)
-        memory_weights = F.softmax(memory_weights, dim=1)  # 归一化
-        
-        # 加权组合记忆
-        # processed_memory: (num_memories, dim)
-        # memory_weights: (batch, num_memories, 1)
-        # 广播后: (batch, num_memories, dim)
-        memory_broadcast = processed_memory.unsqueeze(0) * memory_weights  # (batch, num_memories, dim)
-        memory_combined = memory_broadcast.sum(dim=1)  # (batch, dim)
-        
-        # 将记忆注入到输出
-        memory_injected = memory_combined.unsqueeze(1).expand(-1, seq_len, -1)  # (batch, seq, dim)
-        output = x + memory_injected
-        
-        # 更新记忆（如果启用）
-        if update_memory and self.training:
-            # 分离ω和π分量
-            omega, pi = x.chunk(2, dim=-1)
-            # 使用加权更新率
-            effective_update_rate = self.update_rate * memory_weights.mean()
-            self.memory_state.update_memory(omega, pi, effective_update_rate)
+        # 堆叠所有时间步的输出
+        output = torch.stack(outputs, dim=1)  # (batch, seq, dim)
         
         return output
     
