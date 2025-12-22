@@ -300,15 +300,40 @@ def print_gpu_memory(device: torch.device):
 def main():
     """主训练函数"""
     import sys
+    import argparse
     
-    # 检查命令行参数
-    config_name = 'recommended'
-    if len(sys.argv) > 1:
-        config_name = sys.argv[1]
+    # 解析命令行参数
+    parser = argparse.ArgumentParser(description='扭量化HOPE架构 - GPU训练脚本')
+    parser.add_argument('--config', type=str, default='recommended', 
+                        help='模型配置名称 (default: recommended)')
+    parser.add_argument('--epochs', type=int, default=50,
+                        help='训练轮数 (default: 50, 建议30-100)')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='从checkpoint恢复训练 (模型文件路径, 如: best_model.pth, 默认自动检测)')
+    parser.add_argument('--no-resume', action='store_true',
+                        help='禁用自动恢复，强制从头开始训练')
+    args = parser.parse_args()
+    
+    config_name = args.config
+    num_epochs = args.epochs
+    resume_path = args.resume
+    
+    # 如果没有指定resume路径且未禁用自动恢复，则自动检测checkpoint文件
+    if resume_path is None and not args.no_resume:
+        default_checkpoint = 'best_model.pth'
+        if os.path.exists(default_checkpoint):
+            resume_path = default_checkpoint
+    elif args.no_resume:
+        resume_path = None
     
     print("=" * 80)
     print("扭量化HOPE架构 - GPU训练脚本")
     print(f"使用配置: {config_name.upper()}")
+    print(f"训练轮数: {num_epochs}")
+    if resume_path:
+        print(f"✓ 从checkpoint恢复训练: {resume_path}")
+    else:
+        print("✓ 从头开始训练")
     print("=" * 80)
     print()
     
@@ -341,7 +366,7 @@ def main():
         # 训练超参数
         'batch_size': batch_size,
         'seq_len': 32,
-        'num_epochs': 10,
+        'num_epochs': num_epochs,
         'learning_rate': 1e-4,
         'min_lr': 1e-6,  # 最小学习率（用于cosine退火）
         'gradient_accumulation_steps': 2,  # 梯度累积，等效batch size = 16
@@ -382,15 +407,46 @@ def main():
     # 创建优化器
     optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'], weight_decay=1e-5)
     
+    # 从checkpoint恢复训练（如果指定）
+    start_epoch = 0
+    best_val_loss = float('inf')
+    checkpoint = None
+    if resume_path and os.path.exists(resume_path):
+        print(f"从checkpoint加载: {resume_path}")
+        checkpoint = torch.load(resume_path, map_location=device)
+        
+        # 加载模型状态
+        model.load_state_dict(checkpoint['model_state_dict'])
+        
+        # 加载优化器状态
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        
+        # 恢复训练状态
+        start_epoch = checkpoint.get('epoch', 0) + 1  # 从下一个epoch开始
+        best_val_loss = checkpoint.get('val_loss', float('inf'))
+        print(f"✓ 已恢复训练状态 (从epoch {start_epoch} 开始, 最佳验证损失: {best_val_loss:.6f})")
+        
+        # 如果checkpoint中有配置，确保配置一致（可选）
+        if 'config' in checkpoint:
+            saved_config = checkpoint['config']
+            # 只更新epoch数，保持其他配置不变
+            if saved_config.get('num_epochs') != config.get('num_epochs'):
+                print(f"  注意: checkpoint中的epoch数 ({saved_config.get('num_epochs')}) 与当前设置 ({config.get('num_epochs')}) 不同")
+        print()
+    
     # 混合精度训练
+    scaler = None
     if config['use_amp']:
         try:
             scaler = GradScaler('cuda')
         except TypeError:
             scaler = GradScaler()  # 兼容旧版本
-    else:
-        scaler = None
-    if config['use_amp']:
+        
+        # 从checkpoint恢复scaler状态（如果存在）
+        if checkpoint is not None and 'scaler_state_dict' in checkpoint and checkpoint['scaler_state_dict'] is not None:
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            print("✓ 已恢复混合精度训练scaler状态")
+        
         print("✓ 混合精度训练已启用（可节省约50%显存）")
     
     # 学习率调度器
@@ -408,7 +464,25 @@ def main():
             max_lr=config['learning_rate'],
             min_lr=config.get('min_lr', 1e-6)
         )
-        print(f"✓ 学习率调度器已启用 (Warmup: {warmup_steps}步, 总步数: {total_steps})")
+        
+        # 如果从checkpoint恢复，需要调整学习率调度器的当前步数
+        if start_epoch > 0:
+            # 计算已完成的步数，并设置调度器的当前步数
+            completed_steps = start_epoch * num_batches_per_epoch
+            # 设置current_step为已完成的步数（step()会在调用时+1，所以这里不减1）
+            lr_scheduler.current_step = completed_steps
+            # 手动计算并设置当前学习率（不使用step()避免步数+1）
+            if completed_steps <= warmup_steps:
+                lr = config['learning_rate'] * (completed_steps / warmup_steps)
+            else:
+                progress = (completed_steps - warmup_steps) / max(total_steps - warmup_steps, 1)
+                lr = config.get('min_lr', 1e-6) + (config['learning_rate'] - config.get('min_lr', 1e-6)) * \
+                     (1 + math.cos(math.pi * progress)) / 2
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = lr
+            print(f"✓ 学习率调度器已恢复 (从步数 {completed_steps} 继续, 当前学习率: {lr:.2e}, 总步数: {total_steps})")
+        else:
+            print(f"✓ 学习率调度器已启用 (Warmup: {warmup_steps}步, 总步数: {total_steps})")
     
     # 创建数据集
     print("\n创建数据集...")
@@ -441,11 +515,10 @@ def main():
     print("开始训练...")
     print("=" * 80)
     
-    best_val_loss = float('inf')
     train_losses = []
     val_losses = []
     
-    for epoch in range(config['num_epochs']):
+    for epoch in range(start_epoch, config['num_epochs']):
         epoch_start_time = time.time()
         
         # 创建数据加载器
@@ -492,13 +565,17 @@ def main():
         # 保存最佳模型
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save({
+            checkpoint_data = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_loss': val_loss,
                 'config': config
-            }, 'best_model.pth')
+            }
+            # 保存scaler状态（如果使用混合精度训练）
+            if scaler is not None:
+                checkpoint_data['scaler_state_dict'] = scaler.state_dict()
+            torch.save(checkpoint_data, 'best_model.pth')
             print(f"  ✓ 保存最佳模型 (验证损失: {val_loss:.6f})")
         
         print()
