@@ -22,6 +22,7 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from mt_transformer import TwistorHopeArchitecture
+from mt_transformer.model_configs import get_config, create_full_config
 
 
 class WarmupCosineScheduler:
@@ -298,8 +299,16 @@ def print_gpu_memory(device: torch.device):
 
 def main():
     """主训练函数"""
+    import sys
+    
+    # 检查命令行参数
+    config_name = 'recommended'
+    if len(sys.argv) > 1:
+        config_name = sys.argv[1]
+    
     print("=" * 80)
     print("扭量化HOPE架构 - GPU训练脚本")
+    print(f"使用配置: {config_name.upper()}")
     print("=" * 80)
     print()
     
@@ -307,22 +316,30 @@ def main():
     device, use_gpu = setup_device()
     print()
     
+    # 使用预设配置
+    base_model_config = create_full_config(
+        config_name=config_name,
+        vocab_size=1000,
+        num_memory_cycles=2,
+        use_nested_learning=True,
+        use_phase_compression=True,
+        dropout=0.1
+    )
+    
+    # 根据模型大小调整batch size（recommended配置较大，需要更小的batch size）
+    model_dim = base_model_config.get('dim', 128)
+    if use_gpu:
+        if model_dim >= 256:
+            batch_size = 4  # 大模型使用小batch
+        else:
+            batch_size = 8
+    else:
+        batch_size = 2
+    
     # 训练配置（针对GTX 1650优化）
     config = {
-        'vocab_size': 1000,
-        'dim': 128,
-        'hidden_dim': 128,
-        'num_recurrent_layers': 2,
-        'num_memories': 3,
-        'num_memory_cycles': 2,
-        'use_nested_learning': True,
-        'use_phase_compression': True,
-        'bidirectional': False,
-        'dropout': 0.1,
-        'num_nested_levels': 5,
-        
         # 训练超参数
-        'batch_size': 8 if use_gpu else 2,  # GPU可以使用更大的batch size
+        'batch_size': batch_size,
         'seq_len': 32,
         'num_epochs': 10,
         'learning_rate': 1e-4,
@@ -344,6 +361,9 @@ def main():
         'num_train_samples': 1000,
         'num_val_samples': 200,
     }
+    
+    # 合并模型配置
+    config.update(base_model_config)
     
     print("训练配置:")
     for key, value in config.items():

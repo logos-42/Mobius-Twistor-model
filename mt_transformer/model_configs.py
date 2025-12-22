@@ -30,11 +30,11 @@ MODEL_CONFIGS: Dict[str, Dict[str, Any]] = {
         'use_level_constraints': True
     },
     'recommended': {
-        'dim': 256,
+        'dim': 192,
         'num_recurrent_layers': 3,
         'num_nested_levels': 6,
         'num_memories': 5,
-        'bidirectional': True,
+        'bidirectional': False,  # 暂时禁用双向以避免维度问题
         'num_mobius_cycles': 3,
         'use_adaptive_evolution_rate': True,
         'use_multiscale_evolution': True,
