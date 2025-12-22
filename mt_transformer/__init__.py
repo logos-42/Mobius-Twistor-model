@@ -1,6 +1,6 @@
 """
-MT-Transformer: Möbius-Twistor Transformer Components
-集成到HOPE架构的核心组件，以及HOPE架构迁移到扭量莫比乌斯架构
+MT-HOPE: Möbius-Twistor Nested Learning Architecture
+基于Nested Learning范式的HOPE架构核心组件，结合扭量理论和莫比乌斯拓扑结构
 """
 
 from .spinor_embedding import SpinorEmbedding

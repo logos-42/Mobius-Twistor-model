@@ -1,10 +1,12 @@
-# MT-Transformer: Möbius-Twistor Transformer Components
+# MT-HOPE: Möbius-Twistor Nested Learning Architecture
 
-基于莫比乌斯-扭量理论的Transformer核心组件，集成到HOPE架构中。
+基于莫比乌斯-扭量理论的嵌套学习（Nested Learning）架构，实现Google Research的HOPE架构。
 
 ## 概述
 
-本项目实现了基于扭量理论（Twistor Theory）和莫比乌斯拓扑结构的深度学习组件，并将其集成到Google的HOPE架构（基于Nested Learning范式）中。
+本项目实现了基于**Nested Learning范式**（见NL.pdf论文）的深度学习架构，结合扭量理论（Twistor Theory）和莫比乌斯拓扑结构，实现了Google Research提出的HOPE（Self-modifying Architecture with Continuum Memory）架构。
+
+**重要说明**：这不是传统的Transformer架构，而是基于Nested Learning范式的新架构，采用纯Recurrent结构（无注意力机制），通过嵌套优化和多层级学习实现持续学习能力。
 
 ### 核心组件
 
@@ -16,20 +18,31 @@
 
 ## 理论背景
 
+### Nested Learning 范式
+
+根据NL.pdf论文，Nested Learning（嵌套学习）是一种新的学习范式，将模型表示为一系列嵌套的、多层级的、和/或并行的优化问题，每个问题都有自己的"上下文流"。
+
+- **传统深度学习**：通过堆叠层来增加模型容量，但深度可能不改变计算深度
+- **Nested Learning**：通过嵌套优化和多层级学习，实现更高阶的上下文学习能力
+- **核心洞察**：现有的深度学习方法通过压缩自己的上下文流来学习，这解释了为什么大模型会出现上下文学习能力
+
 ### 扭量理论 (Twistor Theory)
 
-传统Transformer将Token看作高维空间中的**点（向量）**，而MT-Transformer将Token看作**光线（扭量）**。
+本项目将Token从传统的高维空间中的**点（向量）**表示提升为**光线（扭量）**表示。
 
-- **传统模型**：关注点与点的距离（点积注意力）
-- **MT-Transformer**：关注线与线的相交关系（关联关系），并在层与层之间引入莫比乌斯拓扑结构
+- **传统表示**：Token作为向量，关注点与点的距离
+- **扭量表示**：Token作为扭量（两个复数分量ω和π），关注线与线的相交关系（关联关系）
+- **拓扑结构**：在层与层之间引入莫比乌斯拓扑结构，实现拓扑循环
 
 ### HOPE架构
 
-HOPE（Self-modifying Architecture with Continuum Memory）是Google Research提出的基于Nested Learning范式的架构，包含：
+HOPE（Self-modifying Architecture with Continuum Memory）是Google Research在NL.pdf论文中提出的架构，基于Nested Learning范式，包含：
 
-- **Self-Modifying Titans** - 自我修正序列模型
-- **Continuum Memory System (CMS)** - 连续记忆系统
-- **Nested Learning Paradigm** - 嵌套学习范式
+- **Self-Modifying Titans** - 自我修正序列模型，学习如何修改自己的更新算法
+- **Continuum Memory System (CMS)** - 连续记忆系统，泛化了传统的"长期/短期记忆"观点
+- **Nested Learning Paradigm** - 嵌套学习范式，通过多层级嵌套优化实现持续学习
+
+根据NL.pdf，HOPE架构在语言建模、持续学习和长上下文推理任务上表现出色。
 
 ## 模型特点
 
@@ -45,10 +58,12 @@ HOPE（Self-modifying Architecture with Continuum Memory）是Google Research提
    - 多层莫比乌斯循环（默认3层，可配置）实现信息的多尺度传播
    - 自适应演化率机制，根据输入动态调整变换参数
 
-3. **真正的Recurrent架构**
-   - 完全移除注意力机制，采用纯循环结构（基于HOPE的Titans设计）
+3. **纯Recurrent架构（非Transformer）**
+   - **完全移除注意力机制**，采用纯循环结构（基于HOPE的Titans设计）
+   - 这是基于Nested Learning的架构，不是Transformer的变体
    - 支持双向循环，捕获前后文信息
    - 循环层间通过莫比乌斯层实现拓扑连接
+   - 计算复杂度从O(n²)降低到O(n)，更适合长序列建模
 
 4. **嵌套学习范式**
    - 多层级嵌套优化（默认5-6层），ω和π分量独立优化
@@ -292,11 +307,15 @@ M(t+1) = f(M(t), h(t), α)
 
 ## 架构流程
 
-### 扭量化HOPE架构（Recurrent版本）
+### 扭量化HOPE架构（基于Nested Learning的Recurrent架构）
 
 Token IDs → SpinorEmbedding (扭量表示: ω和π) → TwistorSelfModifyingRecurrent (扭量自我修正，Recurrent版本) → TwistorTitansRecurrent (扭量化循环层) → AdaptiveMobiusLayer (自适应莫比乌斯层) → TwistorMemorySystem (扭量记忆系统，循环更新) → TwistorNestedLearning (扭量嵌套学习) → 输出
 
-**注意**: 这是真正的Recurrent结构，完全移除了注意力机制，符合Google HOPE架构的Titans设计。
+**重要说明**:
+- 这是基于**Nested Learning范式**的架构，不是Transformer架构
+- 采用纯Recurrent结构，**完全移除了注意力机制**
+- 符合Google HOPE架构的Titans设计（见NL.pdf论文）
+- 通过嵌套优化实现多层级学习，支持持续学习和上下文学习
 
 ## 关键特性
 
@@ -412,7 +431,7 @@ mobi model/
 1. **几何表示创新**
    - 首次将扭量理论系统性地引入深度学习，将Token从点表示提升为光线表示
    - 在复射影空间中建模，捕获传统向量空间无法表达的几何结构
-   - 为理解Transformer的几何本质提供了新的视角
+   - 为理解序列模型的几何本质提供了新的视角，展示了Nested Learning范式的几何基础
 
 2. **架构范式突破**
    - 证明了纯Recurrent架构（无注意力机制）在序列建模中的有效性
@@ -503,9 +522,14 @@ mobi model/
 
 ## 参考文献
 
-1. **Nested Learning: The Illusion of Deep Learning Architectures** - Google Research (NeurIPS 2025)
+1. **Nested Learning: The Illusion of Deep Learning Architectures** - Google Research (NeurIPS 2025) - **NL.pdf**
    - 本文提出的嵌套学习范式，为HOPE架构的理论基础
    - 阐述了深度学习中"深度"的本质，提出了嵌套优化的重要性
+   - **核心贡献**：
+     - Deep Optimizers：基于NL的优化器，将梯度优化器（如Adam、SGD with Momentum）视为关联记忆模块
+     - Self-Modifying Titans：学习如何修改自己的序列模型
+     - Continuum Memory System：泛化传统长期/短期记忆的新记忆系统
+     - Hope：结合自修改序列模型和连续记忆系统的学习模块
 
 2. **Twistor Theory** - 扭量理论在深度学习中的应用
    - 扭量理论由Roger Penrose提出，用于描述时空几何
