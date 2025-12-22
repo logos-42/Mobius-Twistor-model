@@ -59,4 +59,6 @@ datasets/
 
 # Documentation (本地文档，不推送)
 docs/
+# 但允许理论文档推送
+!docs/*.md
 
