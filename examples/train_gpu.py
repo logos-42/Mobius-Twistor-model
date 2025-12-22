@@ -17,6 +17,17 @@ import os
 import math
 from typing import Dict, Any, Optional
 from tqdm import tqdm
+from torch.utils.data import Dataset, DataLoader
+
+# HuggingFace相关导入
+try:
+    from datasets import load_dataset
+    from transformers import AutoTokenizer
+    HF_AVAILABLE = True
+except ImportError:
+    HF_AVAILABLE = False
+    print("⚠️  警告: 未安装HuggingFace库，将使用虚拟数据集")
+    print("   安装命令: pip install datasets transformers")
 
 # 添加父目录到路径
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -122,6 +133,138 @@ def create_dummy_dataset(vocab_size: int, num_samples: int, seq_len: int, device
     data = torch.randint(0, vocab_size, (num_samples, seq_len), device=device)
     targets = torch.randint(0, vocab_size, (num_samples, seq_len), device=device)
     return data, targets
+
+
+class HFDataset(Dataset):
+    """HuggingFace数据集包装器"""
+    
+    def __init__(self, hf_dataset, tokenizer, seq_len: int, text_column: str = 'text'):
+        """
+        Args:
+            hf_dataset: HuggingFace数据集
+            tokenizer: 分词器
+            seq_len: 序列长度
+            text_column: 文本列名
+        """
+        self.dataset = hf_dataset
+        self.tokenizer = tokenizer
+        self.seq_len = seq_len
+        self.text_column = text_column
+        
+        # 预处理数据集：过滤空文本并分词
+        print("  正在预处理数据集...")
+        self.processed_data = []
+        
+        for item in tqdm(self.dataset, desc="  处理数据"):
+            text = item.get(self.text_column, '')
+            if text and isinstance(text, str) and len(text.strip()) > 0:
+                # 分词
+                tokens = self.tokenizer.encode(
+                    text,
+                    add_special_tokens=True,
+                    max_length=seq_len + 1,
+                    truncation=True,
+                    padding='max_length'
+                )
+                
+                if len(tokens) >= 2:  # 至少需要2个token才能创建输入-目标对
+                    self.processed_data.append(tokens)
+        
+        print(f"  ✓ 处理完成，有效样本数: {len(self.processed_data)}")
+    
+    def __len__(self):
+        return len(self.processed_data)
+    
+    def __getitem__(self, idx):
+        tokens = self.processed_data[idx]
+        # 输入是前seq_len个token，目标是后seq_len个token（右移1位）
+        data = torch.tensor(tokens[:self.seq_len], dtype=torch.long)
+        targets = torch.tensor(tokens[1:self.seq_len+1], dtype=torch.long)
+        return data, targets
+
+
+def load_hf_dataset(
+    dataset_name: str,
+    dataset_config: Optional[str] = None,
+    tokenizer_name: str = 'gpt2',
+    seq_len: int = 32,
+    text_column: str = 'text',
+    max_train_samples: Optional[int] = None,
+    max_val_samples: Optional[int] = None
+):
+    """
+    加载HuggingFace数据集
+    
+    Args:
+        dataset_name: 数据集名称（如 'wikitext', 'bookcorpus'）
+        dataset_config: 数据集配置（如 'wikitext-2-raw-v1'）
+        tokenizer_name: tokenizer名称或路径
+        seq_len: 序列长度
+        text_column: 文本列名
+        max_train_samples: 最大训练样本数（None表示使用全部）
+        max_val_samples: 最大验证样本数（None表示使用全部）
+    
+    Returns:
+        train_dataset, val_dataset, tokenizer, vocab_size
+    """
+    if not HF_AVAILABLE:
+        raise ImportError("需要安装HuggingFace库: pip install datasets transformers")
+    
+    print(f"加载HuggingFace数据集: {dataset_name}")
+    if dataset_config:
+        print(f"  配置: {dataset_config}")
+    
+    # 加载数据集
+    if dataset_config:
+        dataset = load_dataset(dataset_name, dataset_config)
+    else:
+        dataset = load_dataset(dataset_name)
+    
+    # 加载tokenizer
+    print(f"加载tokenizer: {tokenizer_name}")
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    except Exception as e:
+        print(f"  ⚠️  无法加载tokenizer {tokenizer_name}，尝试使用gpt2")
+        tokenizer = AutoTokenizer.from_pretrained('gpt2')
+    
+    # 设置pad_token（如果不存在）
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
+    # 获取训练集和验证集
+    train_split = dataset.get('train', None)
+    val_split = dataset.get('validation', dataset.get('test', None))
+    
+    if train_split is None:
+        raise ValueError(f"数据集 {dataset_name} 没有训练集")
+    
+    # 限制样本数（如果指定）
+    if max_train_samples:
+        train_split = train_split.select(range(min(max_train_samples, len(train_split))))
+    if max_val_samples and val_split:
+        val_split = val_split.select(range(min(max_val_samples, len(val_split))))
+    
+    # 创建数据集
+    print("创建训练集...")
+    train_dataset = HFDataset(train_split, tokenizer, seq_len, text_column)
+    
+    if val_split:
+        print("创建验证集...")
+        val_dataset = HFDataset(val_split, tokenizer, seq_len, text_column)
+    else:
+        print("  ⚠️  没有验证集，将使用训练集的一部分作为验证集")
+        # 从训练集中分割一部分作为验证集
+        val_size = min(len(train_dataset) // 10, 1000)  # 10%或最多1000个样本
+        train_size = len(train_dataset) - val_size
+        train_dataset, val_dataset = torch.utils.data.random_split(
+            train_dataset, [train_size, val_size]
+        )
+    
+    vocab_size = len(tokenizer)
+    print(f"✓ 词汇表大小: {vocab_size}")
+    
+    return train_dataset, val_dataset, tokenizer, vocab_size
 
 
 def train_epoch(
@@ -312,6 +455,21 @@ def main():
                         help='从checkpoint恢复训练 (模型文件路径, 如: best_model.pth, 默认自动检测)')
     parser.add_argument('--no-resume', action='store_true',
                         help='禁用自动恢复，强制从头开始训练')
+    
+    # 数据集相关参数
+    parser.add_argument('--dataset', type=str, default=None,
+                        help='HuggingFace数据集名称 (如: wikitext, bookcorpus, 默认使用虚拟数据集)')
+    parser.add_argument('--dataset-config', type=str, default=None,
+                        help='数据集配置 (如: wikitext-2-raw-v1)')
+    parser.add_argument('--tokenizer', type=str, default='gpt2',
+                        help='Tokenizer名称或路径 (default: gpt2)')
+    parser.add_argument('--text-column', type=str, default='text',
+                        help='文本列名 (default: text)')
+    parser.add_argument('--max-train-samples', type=int, default=None,
+                        help='最大训练样本数 (None表示使用全部)')
+    parser.add_argument('--max-val-samples', type=int, default=None,
+                        help='最大验证样本数 (None表示使用全部)')
+    
     args = parser.parse_args()
     
     config_name = args.config
@@ -341,10 +499,34 @@ def main():
     device, use_gpu = setup_device()
     print()
     
+    # 加载数据集（如果指定）
+    use_hf_dataset = args.dataset is not None and HF_AVAILABLE
+    tokenizer = None
+    vocab_size = 1000  # 默认值
+    default_seq_len = 32  # 默认序列长度
+    
+    if use_hf_dataset:
+        try:
+            train_dataset, val_dataset, tokenizer, vocab_size = load_hf_dataset(
+                dataset_name=args.dataset,
+                dataset_config=args.dataset_config,
+                tokenizer_name=args.tokenizer,
+                seq_len=default_seq_len,  # 使用默认值，后续会在config中统一
+                text_column=args.text_column,
+                max_train_samples=args.max_train_samples,
+                max_val_samples=args.max_val_samples
+            )
+            print(f"✓ 成功加载HuggingFace数据集")
+            print()
+        except Exception as e:
+            print(f"❌ 加载HuggingFace数据集失败: {e}")
+            print("   将使用虚拟数据集")
+            use_hf_dataset = False
+    
     # 使用预设配置
     base_model_config = create_full_config(
         config_name=config_name,
-        vocab_size=1000,
+        vocab_size=vocab_size,  # 使用从数据集获取的vocab_size
         num_memory_cycles=2,
         use_nested_learning=True,
         use_phase_compression=True,
@@ -449,11 +631,82 @@ def main():
         
         print("✓ 混合精度训练已启用（可节省约50%显存）")
     
-    # 学习率调度器
+    # 创建数据集和数据加载器（学习率调度器将在数据集创建后初始化，以便使用正确的样本数）
+    print("\n准备数据集...")
+    if use_hf_dataset:
+        # 使用HuggingFace数据集
+        # 注意：train_dataset和val_dataset已经在上面创建了
+        # 如果config中的seq_len与创建时不同，需要重新创建（这里简化处理，使用创建时的seq_len）
+        if config['seq_len'] != default_seq_len:
+            print(f"  注意: 数据集使用序列长度 {default_seq_len}，配置中为 {config['seq_len']}")
+            print(f"  将使用数据集创建时的序列长度 {default_seq_len}")
+            config['seq_len'] = default_seq_len  # 统一使用数据集创建时的seq_len
+        
+        # 创建DataLoader
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=config['batch_size'],
+            shuffle=True,
+            num_workers=0,  # Windows上建议设为0
+            pin_memory=use_gpu
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=config['batch_size'],
+            shuffle=False,
+            num_workers=0,
+            pin_memory=use_gpu
+        )
+        
+        # 更新配置中的样本数（用于学习率调度器计算）
+        config['num_train_samples'] = len(train_dataset)
+        config['num_val_samples'] = len(val_dataset)
+        
+        print(f"✓ 训练集: {len(train_dataset)} 样本")
+        print(f"✓ 验证集: {len(val_dataset)} 样本")
+    else:
+        # 使用虚拟数据集（向后兼容）
+        print("使用虚拟数据集（用于演示）")
+        train_data, train_targets = create_dummy_dataset(
+            config['vocab_size'],
+            config['num_train_samples'],
+            config['seq_len'],
+            device
+        )
+        val_data, val_targets = create_dummy_dataset(
+            config['vocab_size'],
+            config['num_val_samples'],
+            config['seq_len'],
+            device
+        )
+        
+        # 创建数据加载器（简化版本）
+        def create_loader(data, targets, batch_size, shuffle=True):
+            num_batches = len(data) // batch_size
+            indices = list(range(num_batches))
+            if shuffle:
+                import random
+                random.shuffle(indices)
+            for i in indices:
+                start = i * batch_size
+                end = start + batch_size
+                yield data[start:end], targets[start:end]
+        
+        train_loader = create_loader(train_data, train_targets, config['batch_size'], shuffle=True)
+        val_loader = create_loader(val_data, val_targets, config['batch_size'], shuffle=False)
+        
+        print(f"✓ 训练集: {len(train_data)} 样本")
+        print(f"✓ 验证集: {len(val_data)} 样本")
+    print()
+    
+    # 创建学习率调度器（在数据集创建后，以便使用正确的样本数）
     lr_scheduler = None
     if config.get('use_lr_scheduling', True):
-        # 计算总步数
-        num_batches_per_epoch = config['num_train_samples'] // config['batch_size']
+        # 计算总步数（使用实际的样本数）
+        if use_hf_dataset:
+            num_batches_per_epoch = len(train_loader)
+        else:
+            num_batches_per_epoch = config['num_train_samples'] // config['batch_size']
         total_steps = num_batches_per_epoch * config['num_epochs']
         warmup_steps = int(total_steps * config.get('warmup_ratio', 0.1))  # 默认10%用于warmup
         
@@ -483,33 +736,7 @@ def main():
             print(f"✓ 学习率调度器已恢复 (从步数 {completed_steps} 继续, 当前学习率: {lr:.2e}, 总步数: {total_steps})")
         else:
             print(f"✓ 学习率调度器已启用 (Warmup: {warmup_steps}步, 总步数: {total_steps})")
-    
-    # 创建数据集
-    print("\n创建数据集...")
-    train_data, train_targets = create_dummy_dataset(
-        config['vocab_size'],
-        config['num_train_samples'],
-        config['seq_len'],
-        device
-    )
-    val_data, val_targets = create_dummy_dataset(
-        config['vocab_size'],
-        config['num_val_samples'],
-        config['seq_len'],
-        device
-    )
-    
-    # 创建数据加载器（简化版本）
-    def create_loader(data, targets, batch_size, shuffle=True):
-        num_batches = len(data) // batch_size
-        for i in range(num_batches):
-            start = i * batch_size
-            end = start + batch_size
-            yield data[start:end], targets[start:end]
-    
-    print(f"✓ 训练集: {len(train_data)} 样本")
-    print(f"✓ 验证集: {len(val_data)} 样本")
-    print()
+        print()
     
     # 训练循环
     print("开始训练...")
@@ -521,9 +748,10 @@ def main():
     for epoch in range(start_epoch, config['num_epochs']):
         epoch_start_time = time.time()
         
-        # 创建数据加载器
-        train_loader = create_loader(train_data, train_targets, config['batch_size'], shuffle=True)
-        val_loader = create_loader(val_data, val_targets, config['batch_size'], shuffle=False)
+        # 如果不是使用HuggingFace数据集，需要重新创建数据加载器
+        if not use_hf_dataset:
+            train_loader = create_loader(train_data, train_targets, config['batch_size'], shuffle=True)
+            val_loader = create_loader(val_data, val_targets, config['batch_size'], shuffle=False)
         
         # 训练
         train_loss, train_constraint_loss = train_epoch(
@@ -542,8 +770,11 @@ def main():
         
         # 更新嵌套学习的训练进度（如果使用嵌套学习）
         if config.get('use_nested_learning', True) and model.nested_learning is not None:
-            num_batches_per_epoch = config['num_train_samples'] // config['batch_size']
-            current_step = epoch * num_batches_per_epoch + len(list(train_loader))
+            if use_hf_dataset:
+                num_batches_per_epoch = len(train_loader)
+            else:
+                num_batches_per_epoch = config['num_train_samples'] // config['batch_size']
+            current_step = epoch * num_batches_per_epoch + num_batches_per_epoch
             total_steps = num_batches_per_epoch * config['num_epochs']
             model.nested_learning.set_training_progress(current_step, total_steps)
         
