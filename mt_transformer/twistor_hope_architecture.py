@@ -61,7 +61,11 @@ class TwistorHopeArchitecture(nn.Module):
         # 新增参数：嵌套学习相关
         num_nested_levels: int = 5,
         nested_level_lrs: Optional[list] = None,
-        use_level_constraints: bool = True
+        use_level_constraints: bool = True,
+        # 新增参数：并行优化相关
+        chunk_size: int = 512,
+        use_chunk_parallel: bool = True,
+        use_pipeline_parallel: bool = True
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -75,6 +79,9 @@ class TwistorHopeArchitecture(nn.Module):
         self.use_adaptive_evolution_rate = use_adaptive_evolution_rate
         self.use_multiscale_evolution = use_multiscale_evolution
         self.num_nested_levels = num_nested_levels
+        self.chunk_size = chunk_size
+        self.use_chunk_parallel = use_chunk_parallel
+        self.use_pipeline_parallel = use_pipeline_parallel
         
         # 1. 旋量嵌入层：将Token映射为扭量表示
         # 注意：SpinorEmbedding 的输出维度是 dim*2（因为 omega 和 pi 各占 dim）
@@ -98,7 +105,9 @@ class TwistorHopeArchitecture(nn.Module):
             use_mobius=True,
             num_mobius_cycles=num_mobius_cycles,
             use_adaptive_evolution_rate=use_adaptive_evolution_rate,
-            use_multiscale_evolution=use_multiscale_evolution
+            use_multiscale_evolution=use_multiscale_evolution,
+            chunk_size=chunk_size,
+            use_chunk_parallel=use_chunk_parallel
         )
         
         # 3. 扭量记忆系统（循环更新版本）
@@ -120,7 +129,8 @@ class TwistorHopeArchitecture(nn.Module):
                 constraint_weight=0.1,
                 num_nested_levels=num_nested_levels,
                 nested_level_lrs=nested_level_lrs,
-                use_level_constraints=use_level_constraints
+                use_level_constraints=use_level_constraints,
+                use_pipeline_parallel=use_pipeline_parallel
             )
         else:
             self.nested_learning = None
@@ -195,5 +205,7 @@ class TwistorHopeArchitecture(nn.Module):
                 f'num_mobius_cycles={self.num_mobius_cycles}, '
                 f'use_adaptive_evolution_rate={self.use_adaptive_evolution_rate}, '
                 f'use_multiscale_evolution={self.use_multiscale_evolution}, '
-                f'num_nested_levels={self.num_nested_levels}')
+                f'num_nested_levels={self.num_nested_levels}, '
+                f'chunk_size={self.chunk_size}, use_chunk_parallel={self.use_chunk_parallel}, '
+                f'use_pipeline_parallel={self.use_pipeline_parallel}')
 

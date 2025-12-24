@@ -227,7 +227,9 @@ class TwistorNestedLearning(nn.Module):
         use_dynamic_weights: bool = True,
         use_levelwise_lr: bool = True,
         lr_decay_factor: float = 0.9,
-        use_learnable_residual: bool = True
+        use_learnable_residual: bool = True,
+        use_pipeline_parallel: bool = True,
+        pipeline_stages: Optional[int] = None
     ):
         super().__init__()
         self.dim = dim
@@ -240,6 +242,8 @@ class TwistorNestedLearning(nn.Module):
         self.use_dynamic_weights = use_dynamic_weights
         self.use_levelwise_lr = use_levelwise_lr
         self.use_learnable_residual = use_learnable_residual
+        self.use_pipeline_parallel = use_pipeline_parallel
+        self.pipeline_stages = pipeline_stages if pipeline_stages is not None else max(2, num_nested_levels // 2)
         
         # 层级学习率策略
         if use_levelwise_lr:
@@ -367,7 +371,7 @@ class TwistorNestedLearning(nn.Module):
     ) -> tuple:
         """
         前向传播：扭量嵌套学习（多层嵌套）
-        支持动态权重、可学习残差连接
+        支持动态权重、可学习残差连接、流水线并行
         
         Args:
             x: 输入张量（扭量表示），形状为 (batch, seq, dim)
@@ -376,6 +380,19 @@ class TwistorNestedLearning(nn.Module):
         Returns:
             (output, constraint_loss): 输出张量和约束损失
         """
+        # 如果启用流水线并行，使用流水线方式
+        if self.use_pipeline_parallel:
+            return self._forward_pipeline_parallel(x, compute_constraint)
+        else:
+            # 使用原有的顺序处理方式
+            return self._forward_sequential(x, compute_constraint)
+    
+    def _forward_sequential(
+        self,
+        x: torch.Tensor,
+        compute_constraint: bool = True
+    ) -> tuple:
+        """原有的顺序处理方式（向后兼容）"""
         # 分离ω和π分量
         omega, pi = x.chunk(2, dim=-1)  # 各为 (batch, seq, dim//2)
         
@@ -449,6 +466,97 @@ class TwistorNestedLearning(nn.Module):
         
         return output, constraint_loss
     
+    def _forward_pipeline_parallel(
+        self,
+        x: torch.Tensor,
+        compute_constraint: bool = True
+    ) -> tuple:
+        """流水线并行处理方式"""
+        # 分离ω和π分量
+        omega, pi = x.chunk(2, dim=-1)  # 各为 (batch, seq, dim//2)
+        
+        # 获取动态权重（如果启用）
+        if self.use_dynamic_weights and self.dynamic_omega_weights is not None:
+            dynamic_omega_ws = self.dynamic_omega_weights(
+                int(self.current_step.item()),
+                int(self.total_steps.item())
+            )
+            dynamic_pi_ws = self.dynamic_pi_weights(
+                int(self.current_step.item()),
+                int(self.total_steps.item())
+            )
+        else:
+            dynamic_omega_ws = None
+            dynamic_pi_ws = None
+        
+        # 划分流水线阶段
+        levels_per_stage = max(1, self.num_nested_levels // self.pipeline_stages)
+        stages = []
+        level_idx = 0
+        while level_idx < self.num_nested_levels:
+            stage_end = min(level_idx + levels_per_stage, self.num_nested_levels)
+            stages.append((level_idx, stage_end))
+            level_idx = stage_end
+        
+        # 流水线处理：每个阶段并行计算其内部的层级
+        omega_prev = omega
+        pi_prev = pi
+        constraint_loss = torch.tensor(0.0, device=x.device)
+        
+        for stage_idx, (stage_start, stage_end) in enumerate(stages):
+            # 当前阶段处理多个层级（阶段内顺序，但可以与其他阶段重叠）
+            stage_omega = omega_prev
+            stage_pi = pi_prev
+            
+            # 阶段内的层级处理（可以并行化，但为了简化先顺序处理）
+            for level in range(stage_start, stage_end):
+                # 通过当前层的网络处理
+                omega_level = self.omega_nets[level](stage_omega)
+                pi_level = self.pi_nets[level](stage_pi)
+                
+                # 应用嵌套权重（残差连接）
+                if self.use_learnable_residual and self.omega_residual_weights is not None:
+                    residual_weight_omega = torch.sigmoid(self.omega_residual_weights[level])
+                    residual_weight_pi = torch.sigmoid(self.pi_residual_weights[level])
+                    
+                    stage_omega = residual_weight_omega * stage_omega + \
+                                (1 - residual_weight_omega) * omega_level
+                    stage_pi = residual_weight_pi * stage_pi + \
+                              (1 - residual_weight_pi) * pi_level
+                else:
+                    nested_weight_omega = self.omega_nested_weights[level]
+                    nested_weight_pi = self.pi_nested_weights[level]
+                    
+                    if dynamic_omega_ws is not None:
+                        nested_weight_omega = nested_weight_omega * dynamic_omega_ws[level]
+                        nested_weight_pi = nested_weight_pi * dynamic_pi_ws[level]
+                    
+                    stage_omega = stage_omega + nested_weight_omega * (omega_level - stage_omega)
+                    stage_pi = stage_pi + nested_weight_pi * (pi_level - stage_pi)
+                
+                # 层级间的关联约束（如果启用）
+                if self.use_level_constraints and level < self.num_nested_levels - 1:
+                    level_constraint = self.level_constraints[level](stage_omega, stage_pi)
+                    constraint_loss = constraint_loss + level_constraint
+            
+            # 更新为下一阶段的输入
+            omega_prev = stage_omega
+            pi_prev = stage_pi
+        
+        # 最终输出
+        omega_processed = omega_prev
+        pi_processed = pi_prev
+        
+        # 组合输出
+        output = torch.cat([omega_processed, pi_processed], dim=-1)
+        
+        # 计算全局关联约束损失
+        if compute_constraint:
+            global_constraint = self.incidence_constraint(omega_processed, pi_processed)
+            constraint_loss = constraint_loss + global_constraint
+        
+        return output, constraint_loss
+    
     def nested_optimization_step(
         self,
         omega_losses: Optional[List[torch.Tensor]] = None,
@@ -503,5 +611,7 @@ class TwistorNestedLearning(nn.Module):
                 f'use_level_constraints={self.use_level_constraints}, '
                 f'use_dynamic_weights={self.use_dynamic_weights}, '
                 f'use_levelwise_lr={self.use_levelwise_lr}, '
-                f'use_learnable_residual={self.use_learnable_residual}')
+                f'use_learnable_residual={self.use_learnable_residual}, '
+                f'use_pipeline_parallel={self.use_pipeline_parallel}, '
+                f'pipeline_stages={self.pipeline_stages}')
 

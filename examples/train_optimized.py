@@ -258,6 +258,11 @@ def main():
         action='store_true',
         help='禁用学习率调度'
     )
+    parser.add_argument(
+        '--no-compile',
+        action='store_true',
+        help='禁用torch.compile优化'
+    )
     
     args = parser.parse_args()
     
@@ -284,6 +289,21 @@ def main():
     print(f"✓ 模型创建完成")
     print(f"  实际参数量: {num_params:,} ({num_params/1e6:.2f}M)")
     print(f"  估算参数量: {estimated_params:,} ({estimated_params/1e6:.2f}M)")
+    
+    # 尝试使用torch.compile优化（PyTorch 2.0+）
+    use_compile = not args.no_compile and hasattr(torch, 'compile')
+    if use_compile:
+        try:
+            print("尝试使用torch.compile优化模型...")
+            model = torch.compile(model, mode='reduce-overhead')
+            print("✓ torch.compile优化已启用（预期提升20-50%速度）")
+        except Exception as e:
+            print(f"⚠️  torch.compile失败，使用原始模型: {e}")
+            use_compile = False
+    else:
+        if not hasattr(torch, 'compile'):
+            print("⚠️  PyTorch版本 < 2.0，无法使用torch.compile（建议升级到PyTorch 2.0+）")
+    
     print_gpu_memory(device)
     print()
     

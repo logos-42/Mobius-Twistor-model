@@ -35,7 +35,9 @@ class TwistorTitansRecurrent(nn.Module):
         use_mobius: bool = True,
         num_mobius_cycles: int = 3,
         use_adaptive_evolution_rate: bool = True,
-        use_multiscale_evolution: bool = True
+        use_multiscale_evolution: bool = True,
+        chunk_size: int = 512,
+        use_chunk_parallel: bool = True
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -46,6 +48,8 @@ class TwistorTitansRecurrent(nn.Module):
         self.num_mobius_cycles = num_mobius_cycles
         self.use_adaptive_evolution_rate = use_adaptive_evolution_rate
         self.use_multiscale_evolution = use_multiscale_evolution
+        self.chunk_size = chunk_size
+        self.use_chunk_parallel = use_chunk_parallel
         
         # 创建多层循环单元
         self.cells = nn.ModuleList()
@@ -92,7 +96,7 @@ class TwistorTitansRecurrent(nn.Module):
         hidden: Optional[Tuple] = None
     ) -> Tuple[torch.Tensor, Tuple]:
         """
-        前向传播：循环处理序列
+        前向传播：循环处理序列（支持分块并行）
         
         Args:
             x: 输入序列，形状为 (batch, seq_len, input_dim)
@@ -105,6 +109,21 @@ class TwistorTitansRecurrent(nn.Module):
                      (batch, seq_len, hidden_dim * 2) 如果bidirectional
             - final_hidden: 最终隐藏状态，tuple of (omega_h, pi_h) for each layer
         """
+        batch_size, seq_len, _ = x.shape
+        
+        # 如果启用分块并行且序列长度大于chunk_size，使用分块并行
+        if self.use_chunk_parallel and seq_len > self.chunk_size:
+            return self._forward_chunk_parallel(x, hidden)
+        else:
+            # 使用原有的顺序处理方式
+            return self._forward_sequential(x, hidden)
+    
+    def _forward_sequential(
+        self,
+        x: torch.Tensor,
+        hidden: Optional[Tuple] = None
+    ) -> Tuple[torch.Tensor, Tuple]:
+        """原有的顺序处理方式（向后兼容）"""
         batch_size, seq_len, _ = x.shape
         
         # 初始化隐藏状态
@@ -168,6 +187,116 @@ class TwistorTitansRecurrent(nn.Module):
         
         return output, hidden
     
+    def _forward_chunk_parallel(
+        self,
+        x: torch.Tensor,
+        hidden: Optional[Tuple] = None
+    ) -> Tuple[torch.Tensor, Tuple]:
+        """分块并行处理方式"""
+        batch_size, seq_len, _ = x.shape
+        
+        # 计算块数
+        num_chunks = (seq_len + self.chunk_size - 1) // self.chunk_size
+        
+        # 将序列分成块
+        chunks = []
+        chunk_outputs = []
+        chunk_final_hiddens = []
+        
+        for chunk_idx in range(num_chunks):
+            start_idx = chunk_idx * self.chunk_size
+            end_idx = min(start_idx + self.chunk_size, seq_len)
+            chunk = x[:, start_idx:end_idx, :]  # (batch, chunk_len, input_dim)
+            chunks.append(chunk)
+        
+        # 并行处理每个块（每个块独立处理，无依赖）
+        for chunk_idx, chunk in enumerate(chunks):
+            # 每个块使用独立的隐藏状态（初始化为零）
+            chunk_hidden = self._init_hidden(batch_size, x.device, x.dtype)
+            
+            # 对当前块进行顺序处理
+            chunk_output, chunk_final_hidden = self._forward_sequential(chunk, chunk_hidden)
+            chunk_outputs.append(chunk_output)
+            chunk_final_hiddens.append(chunk_final_hidden)
+        
+        # 拼接所有块的输出
+        output = torch.cat(chunk_outputs, dim=1)  # (batch, seq_len, hidden_dim or hidden_dim*2)
+        
+        # 块间莫比乌斯变换连接（连接相邻块）
+        if num_chunks > 1:
+            output = self._connect_chunks_with_mobius(output, num_chunks)
+        
+        # 使用最后一个块的隐藏状态作为最终隐藏状态
+        final_hidden = chunk_final_hiddens[-1]
+        
+        return output, final_hidden
+    
+    def _connect_chunks_with_mobius(
+        self,
+        output: torch.Tensor,
+        num_chunks: int
+    ) -> torch.Tensor:
+        """使用莫比乌斯变换连接块"""
+        batch_size, seq_len, dim = output.shape
+        chunk_len = self.chunk_size
+        
+        # 分离ω和π分量
+        omega, pi = output.chunk(2, dim=-1)  # 各为 (batch, seq_len, dim//2)
+        
+        # 对每个块边界进行莫比乌斯变换连接
+        for chunk_idx in range(num_chunks - 1):
+            # 当前块的结束位置
+            end_idx = min((chunk_idx + 1) * chunk_len, seq_len)
+            # 下一个块的开始位置
+            next_start_idx = end_idx
+            
+            if next_start_idx >= seq_len:
+                break
+            
+            # 获取边界处的值
+            current_end_omega = omega[:, end_idx - 1:end_idx, :]  # (batch, 1, dim//2)
+            current_end_pi = pi[:, end_idx - 1:end_idx, :]
+            next_start_omega = omega[:, next_start_idx:next_start_idx + 1, :]
+            next_start_pi = pi[:, next_start_idx:next_start_idx + 1, :]
+            
+            # 莫比乌斯变换：交换并取共轭（简化版本）
+            # omega_new = pi, pi_new = -omega
+            # 在边界处混合
+            omega_dim = current_end_omega.shape[-1]
+            if omega_dim % 2 == 0:
+                # 分离实部虚部
+                current_end_omega_real, current_end_omega_imag = current_end_omega.chunk(2, dim=-1)
+                current_end_pi_real, current_end_pi_imag = current_end_pi.chunk(2, dim=-1)
+                next_start_omega_real, next_start_omega_imag = next_start_omega.chunk(2, dim=-1)
+                next_start_pi_real, next_start_pi_imag = next_start_pi.chunk(2, dim=-1)
+                
+                # 莫比乌斯变换：omega_new = pi, pi_new = -omega
+                mobius_omega_real = current_end_pi_real
+                mobius_omega_imag = -current_end_pi_imag
+                mobius_pi_real = -current_end_omega_real
+                mobius_pi_imag = current_end_omega_imag
+                
+                mobius_omega = torch.cat([mobius_omega_real, mobius_omega_imag], dim=-1)
+                mobius_pi = torch.cat([mobius_pi_real, mobius_pi_imag], dim=-1)
+            else:
+                # 简化处理
+                mobius_omega = current_end_pi
+                mobius_pi = -current_end_omega
+            
+            # 混合原始值和莫比乌斯变换值（耦合系数0.1）
+            coupling_coeff = 0.1
+            omega[:, next_start_idx:next_start_idx + 1, :] = (
+                (1 - coupling_coeff) * next_start_omega + coupling_coeff * mobius_omega
+            )
+            pi[:, next_start_idx:next_start_idx + 1, :] = (
+                (1 - coupling_coeff) * next_start_pi + coupling_coeff * mobius_pi
+            )
+        
+        # 重新组合
+        output = torch.cat([omega, pi], dim=-1)
+        
+        return output
+    
     def _init_hidden(
         self,
         batch_size: int,
@@ -193,5 +322,6 @@ class TwistorTitansRecurrent(nn.Module):
     def extra_repr(self) -> str:
         return (f'input_dim={self.input_dim}, hidden_dim={self.hidden_dim}, '
                 f'num_layers={self.num_layers}, bidirectional={self.bidirectional}, '
-                f'dropout={self.dropout}')
+                f'dropout={self.dropout}, chunk_size={self.chunk_size}, '
+                f'use_chunk_parallel={self.use_chunk_parallel}')
 

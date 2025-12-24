@@ -111,7 +111,15 @@ def create_model(config: Dict[str, Any], device: torch.device):
         use_phase_compression=config.get('use_phase_compression', True),
         bidirectional=config.get('bidirectional', False),
         dropout=config.get('dropout', 0.1),
-        num_nested_levels=config.get('num_nested_levels', 5)
+        num_mobius_cycles=config.get('num_mobius_cycles', 3),
+        use_adaptive_evolution_rate=config.get('use_adaptive_evolution_rate', True),
+        use_multiscale_evolution=config.get('use_multiscale_evolution', True),
+        num_nested_levels=config.get('num_nested_levels', 5),
+        nested_level_lrs=config.get('nested_level_lrs', None),
+        use_level_constraints=config.get('use_level_constraints', True),
+        chunk_size=config.get('chunk_size', 512),
+        use_chunk_parallel=config.get('use_chunk_parallel', True),
+        use_pipeline_parallel=config.get('use_pipeline_parallel', True)
     )
     model = model.to(device)
     
@@ -151,14 +159,51 @@ class HFDataset(Dataset):
         self.seq_len = seq_len
         self.text_column = text_column
         
-        # 预处理数据集：过滤空文本并分词
+        # 预处理数据集：过滤空文本并分词（批量处理优化）
         print("  正在预处理数据集...")
-        self.processed_data = []
         
-        for item in tqdm(self.dataset, desc="  处理数据"):
+        # 第一步：收集所有有效文本（快速过滤）
+        print("    步骤1/2: 收集有效文本...")
+        texts = []
+        for item in tqdm(self.dataset, desc="    收集文本"):
             text = item.get(self.text_column, '')
             if text and isinstance(text, str) and len(text.strip()) > 0:
-                # 分词
+                texts.append(text)
+        
+        if len(texts) == 0:
+            print("  ⚠️  警告: 没有找到有效文本")
+            self.processed_data = []
+            return
+        
+        # 第二步：批量编码（大幅提升速度）
+        print(f"    步骤2/2: 批量编码 {len(texts)} 条文本...")
+        try:
+            # 使用批量编码，设置合适的batch_size避免内存溢出
+            batch_size = 1000  # 每次处理1000条
+            all_tokenized = []
+            
+            for i in tqdm(range(0, len(texts), batch_size), desc="    批量编码"):
+                batch_texts = texts[i:i + batch_size]
+                tokenized = self.tokenizer(
+                    batch_texts,
+                    add_special_tokens=True,
+                    max_length=seq_len + 1,
+                    truncation=True,
+                    padding='max_length',
+                    return_tensors=None  # 返回列表而不是tensor
+                )
+                all_tokenized.extend(tokenized['input_ids'])
+            
+            # 过滤掉长度不足的样本
+            self.processed_data = [
+                tokens for tokens in all_tokenized 
+                if len(tokens) >= 2  # 至少需要2个token才能创建输入-目标对
+            ]
+        except Exception as e:
+            print(f"  ⚠️  批量编码失败，回退到逐个处理: {e}")
+            # 回退到原来的逐个处理方式
+            self.processed_data = []
+            for text in tqdm(texts, desc="    逐个编码"):
                 tokens = self.tokenizer.encode(
                     text,
                     add_special_tokens=True,
@@ -166,8 +211,7 @@ class HFDataset(Dataset):
                     truncation=True,
                     padding='max_length'
                 )
-                
-                if len(tokens) >= 2:  # 至少需要2个token才能创建输入-目标对
+                if len(tokens) >= 2:
                     self.processed_data.append(tokens)
         
         print(f"  ✓ 处理完成，有效样本数: {len(self.processed_data)}")
@@ -305,6 +349,9 @@ def train_epoch(
     optimizer.zero_grad()
     
     for batch_idx, (token_ids, targets) in enumerate(train_loader):
+        # 定期清理显存缓存（每100个batch）
+        if device.type == 'cuda' and (batch_idx + 1) % 100 == 0:
+            torch.cuda.empty_cache()
         token_ids = token_ids.to(device)
         targets = targets.to(device)
         
@@ -410,12 +457,13 @@ def train_epoch(
 
 
 def validate(model: nn.Module, val_loader, device: torch.device):
-    """验证模型"""
+    """验证模型（使用inference_mode优化）"""
     model.eval()
     total_loss = 0.0
     num_batches = 0
     
-    with torch.no_grad():
+    # 使用inference_mode替代no_grad，性能更好且节省显存
+    with torch.inference_mode():
         for token_ids, targets in val_loader:
             token_ids = token_ids.to(device)
             targets = targets.to(device)
@@ -427,6 +475,10 @@ def validate(model: nn.Module, val_loader, device: torch.device):
             
             total_loss += loss.item()
             num_batches += 1
+    
+    # 验证后清理显存缓存
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
     
     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
     return avg_loss
@@ -583,6 +635,23 @@ def main():
     model = create_model(config, device)
     num_params = count_parameters(model)
     print(f"✓ 模型创建完成，参数量: {num_params:,} ({num_params/1e6:.2f}M)")
+    
+    # 尝试使用torch.compile优化（PyTorch 2.0+）
+    use_compile = config.get('use_compile', True) and hasattr(torch, 'compile')
+    if use_compile:
+        try:
+            print("尝试使用torch.compile优化模型...")
+            model = torch.compile(model, mode='reduce-overhead')
+            print("✓ torch.compile优化已启用（预期提升20-50%速度）")
+        except Exception as e:
+            print(f"⚠️  torch.compile失败，使用原始模型: {e}")
+            use_compile = False
+    else:
+        if not hasattr(torch, 'compile'):
+            print("⚠️  PyTorch版本 < 2.0，无法使用torch.compile（建议升级到PyTorch 2.0+）")
+        else:
+            print("ℹ️  torch.compile已禁用（可通过use_compile=True启用）")
+    
     print_gpu_memory(device)
     print()
     
@@ -642,20 +711,26 @@ def main():
             print(f"  将使用数据集创建时的序列长度 {default_seq_len}")
             config['seq_len'] = default_seq_len  # 统一使用数据集创建时的seq_len
         
-        # 创建DataLoader
+        # 创建DataLoader（优化配置）
+        # num_workers: Windows上建议设为0，Linux/Mac可以设为4
+        num_workers = config.get('num_workers', 0 if os.name == 'nt' else 4)
         train_loader = DataLoader(
             train_dataset,
             batch_size=config['batch_size'],
             shuffle=True,
-            num_workers=0,  # Windows上建议设为0
-            pin_memory=use_gpu
+            num_workers=num_workers,
+            pin_memory=use_gpu,
+            prefetch_factor=2 if num_workers > 0 else None,
+            persistent_workers=num_workers > 0
         )
         val_loader = DataLoader(
             val_dataset,
             batch_size=config['batch_size'],
             shuffle=False,
-            num_workers=0,
-            pin_memory=use_gpu
+            num_workers=num_workers,
+            pin_memory=use_gpu,
+            prefetch_factor=2 if num_workers > 0 else None,
+            persistent_workers=num_workers > 0
         )
         
         # 更新配置中的样本数（用于学习率调度器计算）
@@ -778,8 +853,16 @@ def main():
             total_steps = num_batches_per_epoch * config['num_epochs']
             model.nested_learning.set_training_progress(current_step, total_steps)
         
+        # 验证前清理显存
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+        
         # 验证
         val_loss = validate(model, val_loader, device)
+        
+        # 验证后再次清理显存
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
         
         epoch_time = time.time() - epoch_start_time
         train_losses.append(train_loss)

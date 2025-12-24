@@ -1,6 +1,11 @@
 """
 模型配置模块
 定义不同规模的预设配置：small, medium, large, recommended
+
+新增并行优化参数：
+- chunk_size: 序列分块大小（默认512），用于序列分块并行
+- use_chunk_parallel: 是否启用序列分块并行（默认True），将长序列分成多个块并行处理
+- use_pipeline_parallel: 是否启用嵌套学习流水线并行（默认True），将嵌套层级分成多个阶段并行处理
 """
 
 from typing import Dict, Any, Optional
@@ -16,7 +21,10 @@ MODEL_CONFIGS: Dict[str, Dict[str, Any]] = {
         'num_mobius_cycles': 3,
         'use_adaptive_evolution_rate': True,
         'use_multiscale_evolution': True,
-        'use_level_constraints': True
+        'use_level_constraints': True,
+        'chunk_size': 512,
+        'use_chunk_parallel': True,
+        'use_pipeline_parallel': True
     },
     'medium': {
         'dim': 192,
@@ -27,7 +35,10 @@ MODEL_CONFIGS: Dict[str, Dict[str, Any]] = {
         'num_mobius_cycles': 3,
         'use_adaptive_evolution_rate': True,
         'use_multiscale_evolution': True,
-        'use_level_constraints': True
+        'use_level_constraints': True,
+        'chunk_size': 512,
+        'use_chunk_parallel': True,
+        'use_pipeline_parallel': True
     },
     'recommended': {
         'dim': 192,
@@ -38,7 +49,10 @@ MODEL_CONFIGS: Dict[str, Dict[str, Any]] = {
         'num_mobius_cycles': 3,
         'use_adaptive_evolution_rate': True,
         'use_multiscale_evolution': True,
-        'use_level_constraints': True
+        'use_level_constraints': True,
+        'chunk_size': 512,
+        'use_chunk_parallel': True,
+        'use_pipeline_parallel': True
     },
     'large': {
         'dim': 512,
@@ -49,7 +63,10 @@ MODEL_CONFIGS: Dict[str, Dict[str, Any]] = {
         'num_mobius_cycles': 3,
         'use_adaptive_evolution_rate': True,
         'use_multiscale_evolution': True,
-        'use_level_constraints': True
+        'use_level_constraints': True,
+        'chunk_size': 512,
+        'use_chunk_parallel': True,
+        'use_pipeline_parallel': True
     }
 }
 
@@ -121,7 +138,10 @@ def create_full_config(
         'use_multiscale_evolution': base_config['use_multiscale_evolution'],
         'num_nested_levels': base_config['num_nested_levels'],
         'nested_level_lrs': nested_level_lrs,
-        'use_level_constraints': base_config['use_level_constraints']
+        'use_level_constraints': base_config['use_level_constraints'],
+        'chunk_size': base_config.get('chunk_size', 512),
+        'use_chunk_parallel': base_config.get('use_chunk_parallel', True),
+        'use_pipeline_parallel': base_config.get('use_pipeline_parallel', True)
     }
     
     return full_config

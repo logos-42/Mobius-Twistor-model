@@ -161,7 +161,9 @@ class TwistorSelfModifyingRecurrent(nn.Module):
         use_mobius: bool = True,
         num_mobius_cycles: int = 3,
         use_adaptive_evolution_rate: bool = True,
-        use_multiscale_evolution: bool = True
+        use_multiscale_evolution: bool = True,
+        chunk_size: int = 512,
+        use_chunk_parallel: bool = True
     ):
         super().__init__()
         self.dim = dim
@@ -173,6 +175,8 @@ class TwistorSelfModifyingRecurrent(nn.Module):
         self.num_mobius_cycles = num_mobius_cycles
         self.use_adaptive_evolution_rate = use_adaptive_evolution_rate
         self.use_multiscale_evolution = use_multiscale_evolution
+        self.chunk_size = chunk_size
+        self.use_chunk_parallel = use_chunk_parallel
         
         # 扭量化Titans循环层（替代注意力机制）
         self.recurrent = TwistorTitansRecurrent(
@@ -184,7 +188,9 @@ class TwistorSelfModifyingRecurrent(nn.Module):
             use_mobius=use_mobius,
             num_mobius_cycles=num_mobius_cycles,
             use_adaptive_evolution_rate=use_adaptive_evolution_rate,
-            use_multiscale_evolution=use_multiscale_evolution
+            use_multiscale_evolution=use_multiscale_evolution,
+            chunk_size=chunk_size,
+            use_chunk_parallel=use_chunk_parallel
         )
         
         # 输出维度调整
@@ -259,5 +265,6 @@ class TwistorSelfModifyingRecurrent(nn.Module):
     def extra_repr(self) -> str:
         return (f'dim={self.dim}, hidden_dim={self.hidden_dim}, '
                 f'num_layers={self.num_layers}, bidirectional={self.bidirectional}, '
-                f'use_mobius={self.use_mobius}')
+                f'use_mobius={self.use_mobius}, chunk_size={self.chunk_size}, '
+                f'use_chunk_parallel={self.use_chunk_parallel}')
 
